@@ -19,7 +19,7 @@
 前往 [Tailscale Admin Console](https://login.tailscale.com/admin/settings/keys) 生成一个 Auth Key，然后在 GitHub 仓库中添加 Secret：
 
 - **Settings → Secrets and variables → Actions → New repository secret**
-- Name: `authkey`
+- Name: `TAILSCALE_AUTH_KEY`
 - Value: 你的 Auth Key
 
 ### 2. 本机安装 Tailscale

@@ -80,7 +80,8 @@ jobs:
 
       - name: Enable Subnet Router and Exit Node
         run: |
-          # 步骤2：登录认证完成后，获取本机子网并开启 Subnet Router 和 Exit Node
+          # 步骤2：认证完成后，使用 tailscale set 开启 Subnet Router 和 Exit Node
+          # tailscale set 不会重置认证状态，无需重新登录
           $localIPs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' }
           
           $subnets = @()
@@ -91,13 +92,12 @@ jobs:
           $advertiseRoutes = $subnets -join ','
           Write-Host "Advertise Routes: $advertiseRoutes"
 
-          # 重新执行 tailscale up 开启 Subnet Router 和 Exit Node（此时已认证，无需再传 authkey）
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+          # 使用 tailscale set 开启 Subnet Router 和 Exit Node
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" set `
             --advertise-routes="$advertiseRoutes" `
             --advertise-exit-node `
             --accept-routes `
-            --accept-dns=false `
-            --reset
+            --accept-dns=false
 
           # 输出 Tailscale 状态确认功能已开启
           Write-Host "=== Tailscale Status ==="

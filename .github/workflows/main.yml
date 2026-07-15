@@ -31,9 +31,20 @@ jobs:
 
       - name: Create RDP User with Secure Password
         run: |
-          # 生成 8 位密码（大小写字母 + 数字）
-          $charSet = [char[]](65..90) + [char[]](97..122) + [char[]](48..57)  # A-Z a-z 0-9
-          $password = -join ($charSet | Get-Random -Count 8)
+          # 生成 8 位密码，确保包含大小写字母和数字，满足密码复杂性要求
+          $upper = [char[]](65..90)   # A-Z
+          $lower = [char[]](97..122)  # a-z
+          $digit = [char[]](48..57)   # 0-9
+          $all   = $upper + $lower + $digit
+
+          # 确保至少包含 1 大写、1 小写、1 数字，其余 5 位随机
+          $password = -join ((
+            ($upper | Get-Random -Count 1) +
+            ($lower | Get-Random -Count 1) +
+            ($digit | Get-Random -Count 1) +
+            ($all   | Get-Random -Count 5)
+          ) | Sort-Object { Get-Random })
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "liaox" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "liaox"

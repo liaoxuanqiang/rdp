@@ -182,32 +182,95 @@ jobs:
 
           echo "TAILSCALE_API_TOKEN is configured. Getting Device ID..."
 
-          # 从本地 tailscale status 获取自身 Device ID
-          DEVICE_ID=$(sudo tailscale status --json | jq -r '.Self.ID')
-          if [ -z "$DEVICE_ID" ] || [ "$DEVICE_ID" = "null" ]; then
-            echo "::error::Could not determine Device ID."
+          # 从本地 tailscale status 获取 Stable Node ID（如 nNSNdatHXZ11CNTRL）
+          STABLE_NODE_ID=$(sudo tailscale status --json | jq -r '.Self.ID')
+          if [ -z "$STABLE_NODE_ID" ] || [ "$STABLE_NODE_ID" = "null" ]; then
+            echo "::error::Could not determine Stable Node ID."
             exit 1
           fi
-          echo "Device ID: $DEVICE_ID"
-          echo "TAILSCALE_DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+          echo "Stable Node ID: $STABLE_NODE_ID"
 
           API_BASE="https://api.tailscale.com/api/v2"
+          AUTH_HEADER="Authorization: Bearer $TAILSCALE_API_TOKEN"
+
+          # 通过 API 获取设备列表，用 nodeId（StableID）匹配出当前设备的数值型 Device ID
+          echo "Fetching device list from API to resolve numeric Device ID..."
+          DEVICES_JSON=$(curl -s -H "$AUTH_HEADER" "$API_BASE/tailnet/-/devices")
+          DEVICE_ID=$(echo "$DEVICES_JSON" | jq -r --arg NODE "$STABLE_NODE_ID" '.devices[] | select(.nodeId == $NODE) | .id')
+          if [ -z "$DEVICE_ID" ] || [ "$DEVICE_ID" = "null" ]; then
+            echo "::error::Could not find current device in API device list."
+            echo "Available devices:"
+            echo "$DEVICES_JSON" | jq -r '.devices[] | "\(.name) (\(.id)) nodeId=\(.nodeId)"'
+            exit 1
+          fi
+          echo "Resolved numeric Device ID: $DEVICE_ID"
+          echo "TAILSCALE_DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
 
           # 1. 设置机器名为 "ubuntu"
           echo "Setting machine name to 'ubuntu'..."
           curl -s -X POST "$API_BASE/device/$DEVICE_ID/name" \
-            -H "Authorization: Bearer $TAILSCALE_API_TOKEN" \
+            -H "$AUTH_HEADER" \
             -H "Content-Type: application/json" \
             -d '{"name":"ubuntu"}' || echo "::warning::Failed to set machine name"
 
-          # 2. 设置机器 IP 为 100.100.1.2
-          echo "Setting machine IP to '100.100.1.2'..."
+          # 2. 设置机器 IP 为 100.64.1.0
+          echo "Setting machine IP to '100.64.1.0'..."
           curl -s -X POST "$API_BASE/device/$DEVICE_ID/ip" \
-            -H "Authorization: Bearer $TAILSCALE_API_TOKEN" \
+            -H "$AUTH_HEADER" \
             -H "Content-Type: application/json" \
-            -d '{"ip":"100.100.1.2"}' || echo "::warning::Failed to set machine IP"
+            -d '{"ip":"100.64.1.0"}' || echo "::warning::Failed to set machine IP"
 
           echo "Tailscale API configuration completed!"
+
+      - name: Ensure MagicDNS is Enabled
+        env:
+          TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
+        run: |
+          if [ -z "$TAILSCALE_API_TOKEN" ]; then
+            echo "::error::TAILSCALE_API_TOKEN is not configured in GitHub Secrets."
+            exit 1
+          fi
+
+          API_BASE="https://api.tailscale.com/api/v2"
+          AUTH_HEADER="Authorization: Bearer $TAILSCALE_API_TOKEN"
+          TAILNET="-"
+
+          echo "Checking MagicDNS status..."
+
+          # 查询当前 tailnet 设置
+          SETTINGS=$(curl -s -H "$AUTH_HEADER" "$API_BASE/tailnet/$TAILNET/settings")
+          MAGIC_DNS_ENABLED=$(echo "$SETTINGS" | jq -r '.magicDNSEnabled // false')
+          echo "MagicDNS enabled: $MAGIC_DNS_ENABLED"
+
+          # 获取 MagicDNS 域名后缀
+          TAILNET_DOMAIN=$(sudo tailscale status --json | jq -r '.MagicDNSSuffix // empty')
+          echo "Tailnet domain: $TAILNET_DOMAIN"
+
+          if [ "$MAGIC_DNS_ENABLED" != "true" ]; then
+            echo "MagicDNS is NOT enabled. Enabling now..."
+            curl -s -X PATCH "$API_BASE/tailnet/$TAILNET/settings" \
+              -H "$AUTH_HEADER" \
+              -H "Content-Type: application/json" \
+              -d '{"magicDNSEnabled":true}' || echo "::warning::Failed to enable MagicDNS"
+
+            # 重新查询确认
+            SETTINGS_CHECK=$(curl -s -H "$AUTH_HEADER" "$API_BASE/tailnet/$TAILNET/settings")
+            MAGIC_DNS_ENABLED=$(echo "$SETTINGS_CHECK" | jq -r '.magicDNSEnabled // false')
+            echo "MagicDNS enabled (verified): $MAGIC_DNS_ENABLED"
+          else
+            echo "MagicDNS is already enabled."
+          fi
+
+          # 输出 MagicDNS 域名到环境变量
+          if [ -n "$TAILNET_DOMAIN" ]; then
+            FULL_DNS="ubuntu.$TAILNET_DOMAIN"
+            echo "TAILSCALE_DNS=$FULL_DNS" >> "$GITHUB_ENV"
+            echo "MagicDNS name: $FULL_DNS"
+          else
+            echo "::warning::Could not determine MagicDNS domain."
+          fi
+
+          echo "MagicDNS check completed!"
 
       - name: Enable Subnet Router and Exit Node
         run: |
@@ -257,7 +320,11 @@ jobs:
         run: |
           echo ""
           echo "=== noVNC Cloud Desktop ACCESS ==="
-          echo "Web URL:  http://$TAILSCALE_IP:$NOVNC_PORT/vnc.html"
+          echo "Web URL (Tailscale IP):   http://$TAILSCALE_IP:$NOVNC_PORT/vnc.html"
+          if [ -n "$TAILSCALE_DNS" ]; then
+            echo "Web URL (MagicDNS):       http://$TAILSCALE_DNS:$NOVNC_PORT/vnc.html"
+          fi
+          echo ""
           echo "VNC IP:   $TAILSCALE_IP"
           echo "VNC Port: $VNC_PORT  (for VNC client)"
           echo "Username: root"

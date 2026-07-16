@@ -147,61 +147,69 @@ jobs:
               exit 1
           }
 
-          Write-Host "TAILSCALE_API_TOKEN is configured. Getting Device ID from local Tailscale..."
+          Write-Host "TAILSCALE_API_TOKEN is configured."
 
-          # 从本地 tailscale status 获取自身 Device ID
+          # 从本地 tailscale status 获取 Stable Node ID（如 n9tntCXRip11CNTRL）
           $statusJson = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null
           $status = $statusJson | ConvertFrom-Json
-          $deviceId = $status.Self.ID
+          $stableNodeId = $status.Self.ID
 
-          if (-not $deviceId) {
-              Write-Warning "Failed to get Device ID from local Tailscale."
-              $allDevices = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
-              $deviceId = $allDevices.Self.ID
-              if (-not $deviceId) {
-                  Write-Warning "Could not determine Device ID. Skipping API configuration."
-                  return
-              }
+          if (-not $stableNodeId) {
+              Write-Warning "Could not determine Stable Node ID. Skipping API configuration."
+              return
           }
-          Write-Host "Current device ID: $deviceId"
+          Write-Host "Local Stable Node ID: $stableNodeId"
 
           $apiBase = "https://api.tailscale.com/api/v2"
           $headers = @{ "Authorization" = "Bearer $env:TAILSCALE_API_TOKEN" }
 
-          # 查询 tailnet 中所有设备，查找已存在的 "windows" 设备
-          Write-Host "Checking for existing devices named 'windows'..."
+          # 获取 API 设备列表，通过 nodeId（StableID）匹配出当前设备的数值型 Device ID
+          Write-Host "Fetching device list from API to resolve numeric Device ID..."
           try {
               $allDevicesResponse = Invoke-RestMethod -Uri "$apiBase/tailnet/-/devices" `
                   -Method Get -Headers $headers
-
-              $existingWindowsDevices = $allDevicesResponse.devices | Where-Object { $_.hostname -eq "windows" -or $_.name -eq "windows" }
-
-              foreach ($oldDevice in $existingWindowsDevices) {
-                  $oldId = $oldDevice.id
-                  if ($oldId -eq $deviceId) {
-                      Write-Host "Skipping current device (it's already named 'windows')."
-                      continue
-                  }
-                  Write-Host "Found existing device: $($oldDevice.name) ($oldId). Removing it..."
-                  try {
-                      # 先过期设备（主动断开连接）
-                      Invoke-RestMethod -Uri "$apiBase/device/$oldId/expire" `
-                          -Method Post -Headers $headers | Out-Null
-                      Write-Host "Device $oldId expired successfully."
-                      
-                      # 等待几秒让过期生效
-                      Start-Sleep -Seconds 3
-                      
-                      # 再删除设备
-                      Invoke-RestMethod -Uri "$apiBase/device/$oldId" `
-                          -Method Delete -Headers $headers | Out-Null
-                      Write-Host "Device $oldId removed successfully."
-                  } catch {
-                      Write-Warning ("Failed to remove old device $oldId : $_")
-                  }
-              }
           } catch {
               Write-Warning "Failed to list devices: $_"
+              return
+          }
+
+          $currentDevice = $allDevicesResponse.devices | Where-Object { $_.nodeId -eq $stableNodeId }
+          if (-not $currentDevice) {
+              Write-Warning "Could not find current device in API device list by nodeId '$stableNodeId'."
+              Write-Warning "Available devices: $($allDevicesResponse.devices | ForEach-Object { "$($_.name)($($_.nodeId))" } | Out-String)"
+              return
+          }
+
+          $deviceId = $currentDevice.id
+          Write-Host "Resolved numeric Device ID: $deviceId (name: $($currentDevice.name), nodeId: $($currentDevice.nodeId))"
+
+          # 查询所有设备，查找已存在的 "windows" 设备（排除自身）
+          Write-Host "Checking for existing devices named 'windows'..."
+          $existingWindowsDevices = $allDevicesResponse.devices | Where-Object { $_.hostname -eq "windows" -or $_.name -eq "windows" }
+
+          foreach ($oldDevice in $existingWindowsDevices) {
+              $oldId = $oldDevice.id
+              if ($oldId -eq $deviceId) {
+                  Write-Host "Skipping current device (it's already the 'windows' device)."
+                  continue
+              }
+              Write-Host "Found existing device: $($oldDevice.name) ($oldId). Removing it..."
+              try {
+                  # 先过期设备（主动断开连接）
+                  Invoke-RestMethod -Uri "$apiBase/device/$oldId/expire" `
+                      -Method Post -Headers $headers | Out-Null
+                  Write-Host "Device $oldId expired successfully."
+
+                  # 等待几秒让过期生效
+                  Start-Sleep -Seconds 3
+
+                  # 再删除设备
+                  Invoke-RestMethod -Uri "$apiBase/device/$oldId" `
+                      -Method Delete -Headers $headers | Out-Null
+                  Write-Host "Device $oldId removed successfully."
+              } catch {
+                  Write-Warning ("Failed to remove old device $oldId : $_")
+              }
           }
 
           # 设置当前设备名为 "windows"

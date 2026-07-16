@@ -130,6 +130,16 @@ jobs:
           try {
               $allDevices = Invoke-RestMethod -Uri "$apiBase/tailnet/-/devices" `
                   -Method Get -Headers $headers
+              # 重要：从 API 设备列表中解析当前设备的数值型 Device ID
+              # tailscale status --json 的 Self.ID 返回 Stable Node ID（如 nNSNdatHXZ11CNTRL）
+              # 但 Tailscale API v2 的 device 端点要求数值型 Device ID（如 4164901093819459）
+              $currentApiDevice = $allDevices.devices | Where-Object { $_.nodeId -eq $deviceId }
+              if ($currentApiDevice) {
+                  $deviceId = $currentApiDevice.id
+                  Write-Host "Resolved numeric Device ID from API: $deviceId"
+              } else {
+                  Write-Warning "Could not find current device in API device list by nodeId. Will attempt using local ID."
+              }
               $oldWindowsDevices = $allDevices.devices | Where-Object {
                   $_.hostname -eq "windows" -and $_.id -ne $deviceId
               }

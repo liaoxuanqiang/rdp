@@ -41,6 +41,12 @@ jobs:
             exit 1
           fi
 
+          # vncpasswd 由 tigervnc-common 提供，确保已安装
+          if ! command -v vncpasswd &>/dev/null; then
+            echo "vncpasswd not found, installing tigervnc-common..."
+            sudo apt-get install -y --no-install-recommends tigervnc-common
+          fi
+
           # VNC 显示号 :1 => 监听 5901
           VNC_DISPLAY=":1"
           VNC_PORT=5901

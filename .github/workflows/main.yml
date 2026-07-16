@@ -112,6 +112,63 @@ jobs:
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           Write-Host "Tailscale authenticated successfully! IP: $tsIP"
 
+      - name: Set Machine Name and IP via Tailscale API
+        env:
+          TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
+        run: |
+          # 验证 TAILSCALE_API_TOKEN 是否已配置
+          if ("$env:TAILSCALE_API_TOKEN" -eq "") {
+              Write-Error "TAILSCALE_API_TOKEN is not configured in GitHub Secrets. Please add it."
+              exit 1
+          }
+
+          Write-Host "TAILSCALE_API_TOKEN is configured. Getting Device ID from local Tailscale..."
+
+          # 从本地 tailscale status 获取自身 Device ID
+          $statusJson = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null
+          $status = $statusJson | ConvertFrom-Json
+          $deviceId = $status.Self.ID  # 例如 n5W7G8... 格式 node ID
+
+          if (-not $deviceId) {
+              Write-Warning "Failed to get Device ID from local Tailscale. Attempting to find via API..."
+              # 从已分配的 Tailscale IP 查找设备 ID
+              $allDevices = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+              $deviceId = $allDevices.Self.ID
+              if (-not $deviceId) {
+                  Write-Error "Could not determine Device ID. Aborting API configuration."
+                  exit 1
+              }
+          }
+          Write-Host "Device ID: $deviceId"
+          echo "TAILSCALE_DEVICE_ID=$deviceId" >> $env:GITHUB_ENV
+
+          $apiBase = "https://api.tailscale.com/api/v2"
+          $headers = @{ "Authorization" = "Bearer $env:TAILSCALE_API_TOKEN" }
+
+          # 1. 设置机器名为 "windows"
+          Write-Host "Setting machine name to 'windows'..."
+          $nameBody = @{ "name" = "windows" } | ConvertTo-Json
+          try {
+              $nameResponse = Invoke-RestMethod -Uri "$apiBase/device/$deviceId/name" `
+                  -Method Post -Headers $headers -Body $nameBody -ContentType "application/json"
+              Write-Host "Machine name set successfully: $($nameResponse | ConvertTo-Json)"
+          } catch {
+              Write-Warning "Failed to set machine name: $_"
+          }
+
+          # 2. 设置机器 IP 为 100.100.1.1
+          Write-Host "Setting machine IP to '100.100.1.1'..."
+          $ipBody = @{ "ip" = "100.100.1.1" } | ConvertTo-Json
+          try {
+              $ipResponse = Invoke-RestMethod -Uri "$apiBase/device/$deviceId/ip" `
+                  -Method Post -Headers $headers -Body $ipBody -ContentType "application/json"
+              Write-Host "Machine IP set successfully: $($ipResponse | ConvertTo-Json)"
+          } catch {
+              Write-Warning "Failed to set machine IP: $_"
+          }
+
+          Write-Host "Tailscale API configuration completed!"
+
       - name: Enable Subnet Router and Exit Node
         run: |
           Write-Host "Tailscale is authenticated. Enabling Subnet Router and Exit Node..."

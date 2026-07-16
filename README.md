@@ -7,7 +7,7 @@
 1. **配置 RDP** — 修改注册表启用远程桌面，禁用网络级身份认证（NLA），开放 3389 端口防火墙规则
 2. **创建用户** — 使用在 GitHub Secrets 中配置的用户名和密码自动创建管理员用户
 3. **安装 Tailscale** — 下载并静默安装 Tailscale 客户端
-4. **连接 Tailscale 并开启功能** — 使用 Auth Key 一次性登录 Tailscale 网络，自动检测子网并开启 Subnet Router 和 Exit Node，`--unattended` 确保以系统服务运行，用户切换不影响连接
+4. **连接 Tailscale 并调用 API 配置** — 使用 Auth Key 一次性登录 Tailscale 网络，自动检测子网并开启 Subnet Router 和 Exit Node；同时调用 Tailscale REST API 设置机器名为 `windows`、固定 IP 为 `100.100.1.1`。`--unattended` 确保以系统服务运行，用户切换不影响连接
 5. **验证连通性** — 测试 3389 端口 TCP 连接是否正常
 6. **保持运行** — 持续输出连接信息并保持 Runner 活跃，直到手动取消
 
@@ -37,7 +37,17 @@
 - Name: `RDP_PASSWORD`
 - Value: 你想要的 RDP 登录密码（需满足 Windows 密码复杂性要求：大小写字母 + 数字）
 
-### 4. 本机安装 Tailscale
+### 4. Tailscale API Token
+
+前往 [Tailscale Admin Console → Keys](https://login.tailscale.com/admin/settings/keys) 生成一个 **API Access Token**（需要有 `devices:core` 权限），然后在 GitHub 仓库中添加 Secret：
+
+- **Settings → Secrets and variables → Actions → New repository secret**
+- Name: `TAILSCALE_API_TOKEN`
+- Value: 你的 Tailscale API Token（以 `tskey-api-` 开头）
+
+此 Token 用于通过 Tailscale REST API 设置机器的名称和固定 IP 地址。
+
+### 5. 本机安装 Tailscale
 
 用于连接 Runner 的客户端设备也需要安装 Tailscale 并登录同一账号。
 

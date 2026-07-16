@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  secure-rdp:
+  windows-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
 
@@ -307,20 +307,33 @@ jobs:
       - name: Install and Start llama.cpp
         run: |
           Write-Host "Installing llama.cpp..."
-          # 安装 llama.cpp
-          irm https://llama.app/install.ps1 | iex
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "llama.cpp installation failed"
-              exit 1
+          # 安装前先建好目标目录，避免安装脚本内部 Remove-Item 因目录不存在而报错
+          $null = New-Item -Path "$env:LOCALAPPDATA\llama-app" -ItemType Directory -Force
+          # 安装 llama.cpp（用 try/catch 兜底，避免脚本内部非关键错误导致整个 step 失败）
+          try {
+              $installScript = Invoke-RestMethod -Uri "https://llama.app/install.ps1"
+              Invoke-Expression $installScript
+          } catch {
+              Write-Warning "llama.cpp installer reported an error (non-critical): $_"
           }
-          Write-Host "llama.cpp installed successfully."
+          # 验证 llama.exe 是否可用
+          $llamaPath = & where.exe llama.exe 2>$null
+          if (-not $llamaPath) {
+              $llamaPath = "$env:LOCALAPPDATA\Programs\llama\llama.exe"
+              if (-not (Test-Path $llamaPath)) {
+                  Write-Error "llama.exe not found after installation"
+                  exit 1
+              }
+          }
+          Write-Host "llama.cpp installed successfully. Path: $llamaPath"
           
           # 启动 llama.exe serve 作为后台任务（监听 8080 端口）
           Write-Host "Starting llama.exe serve on port 8080..."
           $jobScript = {
-              & "llama.exe" serve --port 8080 --host 0.0.0.0
+              param($exePath)
+              & $exePath serve --port 8080 --host 0.0.0.0
           }
-          Start-Job -Name "llama-serve" -ScriptBlock $jobScript
+          Start-Job -Name "llama-serve" -ScriptBlock $jobScript -ArgumentList $llamaPath
           
           # 等待几秒确认服务启动
           Start-Sleep -Seconds 5

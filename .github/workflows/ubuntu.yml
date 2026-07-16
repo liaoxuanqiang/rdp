@@ -29,7 +29,7 @@ jobs:
 
           # 一些常用的桌面辅助工具
           sudo apt-get install -y --no-install-recommends \
-            dbus-x11 x11-utils firefox espeak ipcalc jq
+            dbus-x11 x11-utils firefox espeak jq
 
       - name: Configure TigerVNC server
         env:
@@ -95,7 +95,8 @@ with open(os.path.expanduser('~/.vnc/passwd'), 'wb') as f:
 
           if ! ss -ltn | grep -q ":$VNC_PORT "; then
             echo "::error::VNC server failed to start on $VNC_DISPLAY"
-            cat "$HOME/.vnc/*:1.log" || true
+            # 不使用双引号包裹 glob，否则通配符无法展开
+            cat $HOME/.vnc/*:1.log 2>/dev/null || true
             exit 1
           fi
 
@@ -217,12 +218,11 @@ with open(os.path.expanduser('~/.vnc/passwd'), 'wb') as f:
             -H "Content-Type: application/json" \
             -d '{"name":"ubuntu"}' || echo "::warning::Failed to set machine name"
 
-          # 2. 设置机器 IP 为 100.64.1.0
-          echo "Setting machine IP to '100.64.1.0'..."
-          curl -s -X POST "$API_BASE/device/$DEVICE_ID/ip" \
-            -H "$AUTH_HEADER" \
-            -H "Content-Type: application/json" \
-            -d '{"ip":"100.64.1.0"}' || echo "::warning::Failed to set machine IP"
+          # 2. 设置机器 IP：Tailscale CLI/API v2 不提供设置 IP 的接口
+          #    Tailscale 自动分配 IP，如需固定 IP 请在 Admin Console 中设置
+          #    （每个设备注册到同一 tailnet 会获得相同的稳定 IP，不需要手动设置）
+          echo "IP is automatically assigned by Tailscale (stable per device)."
+          echo "To set a fixed IP, use the Admin Console (no CLI/API v2 endpoint exists)."
 
           echo "Tailscale API configuration completed!"
 
@@ -281,19 +281,21 @@ with open(os.path.expanduser('~/.vnc/passwd'), 'wb') as f:
           echo "Enabling Subnet Router and Exit Node..."
 
           # 获取本机 IPv4 地址，计算子网
-          ADVERTISE_ROUTES=""
-          for ip in $(ip -4 -o addr show scope global | awk '{print $4}'); do
-            ADDR=$(echo "$ip" | cut -d/ -f1)
-            PREFIX=$(echo "$ip" | cut -d/ -f2)
-            NETWORK=$(ipcalc -n "$ip" | awk -F= '{print $2}')
-            SUBNET="$NETWORK/$PREFIX"
-            echo "Interface: $ip -> $SUBNET"
-            if [ -n "$ADVERTISE_ROUTES" ]; then
-              ADVERTISE_ROUTES="$ADVERTISE_ROUTES,$SUBNET"
-            else
-              ADVERTISE_ROUTES="$SUBNET"
-            fi
-          done
+          # 使用 Python 的 ipaddress 模块（跨版本兼容，无需 ipcalc）
+          ADVERTISE_ROUTES=$(python3 -c "
+import ipaddress, subprocess, sys
+# 解析 ip -4 -o addr show scope global 输出
+out = subprocess.run(['ip', '-4', '-o', 'addr', 'show', 'scope', 'global'],
+                     capture_output=True, text=True).stdout
+addrs = []
+for line in out.strip().split(chr(10)):
+    parts = line.strip().split()
+    if len(parts) >= 4:
+        cidr = parts[3]
+        net = ipaddress.IPv4Network(cidr, strict=False)
+        addrs.append(str(net))
+print(','.join(addrs))
+")
           echo "Advertise Routes: $ADVERTISE_ROUTES"
 
           sudo tailscale set \

@@ -88,11 +88,36 @@ jobs:
 
           Write-Host "TAILSCALE_AUTH_KEY is configured. Authenticating Tailscale..."
 
-          # 使用认证密钥登录 Tailscale，主机名设为 windows（MagicDNS 可用 windows.<tailnet>.ts.net 连接）
+          # 在认证前先计算子网路由（避免后续 tailscale set 导致失联）
+          Write-Host "Calculating subnet routes..."
+          $localIPs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' -and $_.InterfaceAlias -ne 'Tailscale' }
+          $subnets = @()
+          foreach ($ip in $localIPs) {
+              $prefixLen = $ip.PrefixLength
+              $ipBytes = [System.Net.IPAddress]::Parse($ip.IPAddress).GetAddressBytes()
+              [Array]::Reverse($ipBytes)
+              $ipInt = [System.BitConverter]::ToUInt32($ipBytes, 0)
+              $maskInt = [uint32]::MaxValue -shl (32 - $prefixLen)
+              $netInt = $ipInt -band $maskInt
+              $netBytes = [System.BitConverter]::GetBytes($netInt)
+              [Array]::Reverse($netBytes)
+              $networkAddr = [System.Net.IPAddress]::new($netBytes).IPAddressToString
+              $subnet = "$networkAddr/$prefixLen"
+              $subnets += $subnet
+              Write-Host "Interface $($ip.InterfaceAlias): $($ip.IPAddress)/$prefixLen → $subnet"
+          }
+          $advertiseRoutes = $subnets -join ','
+          Write-Host "Advertise Routes: $advertiseRoutes"
+
+          # 使用认证密钥登录 Tailscale，一步完成认证+路由配置，避免后续 tailscale set 导致失联
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
             --hostname=windows `
-            --unattended
+            --unattended `
+            --advertise-routes="$advertiseRoutes" `
+            --advertise-exit-node `
+            --accept-routes `
+            --accept-dns=false
 
           # 等待 Tailscale 分配 IP
           $tsIP = $null
@@ -263,45 +288,6 @@ jobs:
 
           Write-Host "MagicDNS check completed!"
 
-      - name: Enable Subnet Router and Exit Node
-        run: |
-          Write-Host "Tailscale is authenticated. Enabling Subnet Router and Exit Node..."
-
-          # 获取本机所有网卡的 IPv4 地址，计算正确的子网路由（网络地址）
-          $localIPs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' -and $_.InterfaceAlias -ne 'Tailscale' }
-          
-          $subnets = @()
-          foreach ($ip in $localIPs) {
-              $prefixLen = $ip.PrefixLength
-              # 将 IP 地址转换为 uint32 计算网络地址
-              $ipBytes = [System.Net.IPAddress]::Parse($ip.IPAddress).GetAddressBytes()
-              [Array]::Reverse($ipBytes)
-              $ipInt = [System.BitConverter]::ToUInt32($ipBytes, 0)
-              # 计算子网掩码并得到网络地址
-              $maskInt = [uint32]::MaxValue -shl (32 - $prefixLen)
-              $netInt = $ipInt -band $maskInt
-              $netBytes = [System.BitConverter]::GetBytes($netInt)
-              [Array]::Reverse($netBytes)
-              $networkAddr = [System.Net.IPAddress]::new($netBytes).IPAddressToString
-              $subnet = "$networkAddr/$prefixLen"
-              $subnets += $subnet
-              Write-Host "Interface $($ip.InterfaceAlias): $($ip.IPAddress)/$prefixLen → $subnet"
-          }
-          $advertiseRoutes = $subnets -join ','
-          Write-Host "Advertise Routes: $advertiseRoutes"
-
-          # 认证完成后，使用 tailscale set 开启 Subnet Router 和 Exit Node（不重置认证状态）
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" set `
-            --advertise-routes="$advertiseRoutes" `
-            --advertise-exit-node `
-            --accept-routes `
-            --accept-dns=false
-
-          # 输出 Tailscale 状态确认功能已开启
-          Write-Host "=== Tailscale Status ==="
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-          Write-Host "Subnet Router and Exit Node enabled."
-      
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"

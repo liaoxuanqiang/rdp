@@ -88,10 +88,10 @@ jobs:
 
           Write-Host "TAILSCALE_AUTH_KEY is configured. Authenticating Tailscale..."
 
-          # 使用认证密钥登录 Tailscale（仅认证，不配其他功能）
+          # 使用认证密钥登录 Tailscale，主机名设为 windows（MagicDNS 可用 windows.<tailnet>.ts.net 连接）
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID `
+            --hostname=windows `
             --unattended
 
           # 等待 Tailscale 分配 IP
@@ -145,26 +145,53 @@ jobs:
           $apiBase = "https://api.tailscale.com/api/v2"
           $headers = @{ "Authorization" = "Bearer $env:TAILSCALE_API_TOKEN" }
 
-          # 1. 设置机器名为 "windows"
+          # 1. 设置机器名为 "windows"（tailscale up 已设 hostname，此处确认）
           Write-Host "Setting machine name to 'windows'..."
           $nameBody = @{ "name" = "windows" } | ConvertTo-Json
           try {
               $nameResponse = Invoke-RestMethod -Uri "$apiBase/device/$deviceId/name" `
                   -Method Post -Headers $headers -Body $nameBody -ContentType "application/json"
-              Write-Host "Machine name set successfully: $($nameResponse | ConvertTo-Json)"
+              Write-Host "Machine name set successfully."
           } catch {
               Write-Warning "Failed to set machine name: $_"
           }
 
-          # 2. 设置机器 IP 为 100.100.1.1
+          # 2. 尝试设置机器 IP 为 100.100.1.1（API 要求 ip 字段为数组格式）
           Write-Host "Setting machine IP to '100.100.1.1'..."
-          $ipBody = @{ "ip" = "100.100.1.1" } | ConvertTo-Json
+          $ipBody = @{ "ip" = @("100.100.1.1") } | ConvertTo-Json
+          $ipSetOk = $false
           try {
               $ipResponse = Invoke-RestMethod -Uri "$apiBase/device/$deviceId/ip" `
                   -Method Post -Headers $headers -Body $ipBody -ContentType "application/json"
               Write-Host "Machine IP set successfully: $($ipResponse | ConvertTo-Json)"
+              $ipSetOk = $true
           } catch {
-              Write-Warning "Failed to set machine IP: $_"
+              Write-Warning "Failed to set machine IP to 100.100.1.1: $_"
+              Write-Host "Will use auto-assigned Tailscale IP instead."
+          }
+
+          # 3. 重新读取实际 Tailscale IP（无论是否设置成功）
+          $actualIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          if ($actualIP) {
+              echo "TAILSCALE_IP=$actualIP" >> $env:GITHUB_ENV
+              Write-Host "Current Tailscale IP: $actualIP"
+          }
+
+          # 4. 获取 MagicDNS 域名（通过 API 获取 tailnet 名称）
+          try {
+              $meResponse = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/-/settings" `
+                  -Method Get -Headers $headers
+              $tailnetName = $meResponse.MagicDNSEnabled
+              # 从 API 获取 tailnet 的 MagicDNS 基础域名
+              $dnsName = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+              $magicDNSName = $dnsName.MagicDNSSuffix
+              if ($magicDNSName) {
+                  $fullDNS = "windows.$magicDNSName"
+                  echo "TAILSCALE_DNS=$fullDNS" >> $env:GITHUB_ENV
+                  Write-Host "MagicDNS name: $fullDNS"
+              }
+          } catch {
+              Write-Warning "Could not retrieve MagicDNS name: $_"
           }
 
           Write-Host "Tailscale API configuration completed!"
@@ -226,7 +253,10 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Address (Tailscale IP): $env:TAILSCALE_IP"
+          if ($env:TAILSCALE_DNS) {
+              Write-Host "Address (MagicDNS):    $env:TAILSCALE_DNS"
+          }
           Write-Host "Username: $env:RDP_USERNAME"
           Write-Host "Password: $env:RDP_PASSWORD"
           Write-Host "==================`n"
@@ -236,4 +266,3 @@ jobs:
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
           }
-          ```

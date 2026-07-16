@@ -1,6 +1,11 @@
-# RDP via GitHub Actions + Tailscale
+# RDP / Cloud Desktop via GitHub Actions + Tailscale
 
-通过 GitHub Actions 在 Windows Runner 上自动配置远程桌面（RDP），并借助 [Tailscale](https://tailscale.com/) 组网实现安全的远程访问。
+通过 GitHub Actions 在 Runner 上自动配置远程桌面，并借助 [Tailscale](https://tailscale.com/) 组网实现安全的远程访问。支持两套方案：
+
+| 方案 | 平台 | 桌面 | 远程协议 | 访问方式 | Workflow |
+|------|------|------|----------|----------|----------|
+| **Windows RDP** | `windows-latest` | Windows 桌面 | RDP (3389) | RDP 客户端 (`mstsc`) | `windows.yml` |
+| **Ubuntu noVNC** | `ubuntu-latest` | Xfce4 | VNC (5901) + noVNC (6080) | 浏览器 / VNC 客户端 | `ubuntu.yml` |
 
 ## 工作原理
 
@@ -97,7 +102,8 @@ Password:  <你配置的密码>
 rdp/
 ├── .github/
 │   └── workflows/
-│       └── main.yml      # GitHub Actions 工作流定义
+│       ├── windows.yml   # Windows RDP 工作流
+│       └── ubuntu.yml    # Ubuntu Xfce + noVNC 工作流
 └── README.md
 ```
 

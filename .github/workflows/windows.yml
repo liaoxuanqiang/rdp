@@ -80,8 +80,7 @@ jobs:
           # 使用认证密钥登录 Tailscale，主机名设为 windows（MagicDNS 可用 windows.<tailnet>.ts.net 连接）
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=windows `
-            --unattended
+            --hostname=windows
           # 等待 Tailscale 分配 IP
           $tsIP = $null
           $retries = 0

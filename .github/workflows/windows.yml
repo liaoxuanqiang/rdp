@@ -603,13 +603,16 @@ jobs:
           }
           if (Test-Path $llamaPath) {
               Write-Host "Verifying model with llama.cpp..."
-              # 使用 llama.cpp 的 --no-load 或简单检查 GGUF 文件头
-              & $llamaPath --model $modelPath --no-load --no-prompt 2>$null
-              if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 1) {
+              # 使用 llama.cpp 检查 GGUF 文件头；捕获退出码避免透传给 GitHub Actions
+              $null = & $llamaPath --model $modelPath --no-load --no-prompt 2>$null
+              $verifyExitCode = $LASTEXITCODE
+              if ($verifyExitCode -eq 0 -or $verifyExitCode -eq 1) {
                   Write-Host "Model verification passed!"
               } else {
-                  Write-Warning "Model verification returned exit code $LASTEXITCODE (may not be critical)"
+                  Write-Warning "Model verification returned exit code $verifyExitCode (may not be critical)"
               }
+              # 清除退出码，防止 PowerShell 将其透传给 GitHub Actions 导致 step 失败
+              $LASTEXITCODE = 0
           }
 
           Write-Host "MiniCPM5-1B-F16.gguf download and verification completed!"

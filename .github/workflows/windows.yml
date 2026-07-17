@@ -152,9 +152,9 @@ jobs:
           Write-Host "--- Uninstalling R for Windows ---"
           Stop-SoftwareProcesses -ProcessNames @("R", "Rgui", "Rscript", "RTerm")
           Uninstall-Software "R for Windows*"
-          Write-Host "--- Uninstalling Rtools (120s timeout) ---"
+          Write-Host "--- Uninstalling Rtools (300s timeout) ---"
           Stop-SoftwareProcesses -ProcessNames @("gcc", "make", "sh", "rtools")
-          Uninstall-Software "Rtools*" -timeoutSeconds 120
+          Uninstall-Software "Rtools*" -timeoutSeconds 300
           Write-Host "--- Uninstalling AWS CLI ---"
           Stop-SoftwareProcesses -ProcessNames @("aws")
           Uninstall-Software "AWS Command Line Interface*"

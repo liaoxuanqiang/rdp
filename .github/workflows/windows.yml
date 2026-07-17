@@ -64,7 +64,7 @@ jobs:
           Write-Host "=== Uninstalling unnecessary software ==="
           
           # Helper: 从注册表查找并静默卸载软件
-          function Uninstall-Software($namePattern) {
+          function Uninstall-Software($namePattern, $timeoutSeconds = 60) {
               $keys = @(
                   'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
                   'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
@@ -105,10 +105,11 @@ jobs:
                       }
                       
                       Write-Host "  Running: $($parts[0]) $($parts[1])"
-                      # 加超时避免卡死，60 秒后强制终止
+                      # 加超时避免卡死，$timeoutSeconds 秒后强制终止
+                      $timeoutMs = $timeoutSeconds * 1000
                       $proc = Start-Process -FilePath $parts[0] -ArgumentList $parts[1] -NoNewWindow -PassThru
-                      if (-not $proc.WaitForExit(60000)) {
-                          Write-Warning "  Uninstall timed out after 60s, killing process."
+                      if (-not $proc.WaitForExit($timeoutMs)) {
+                          Write-Warning "  Uninstall timed out after ${timeoutSeconds}s, killing process."
                           $proc.Kill()
                       }
                   }
@@ -139,26 +140,32 @@ jobs:
           Uninstall-Software "Azure Cosmos DB Emulator*"
           Write-Host "--- Uninstalling Azure Service Fabric SDK ---"
           Uninstall-Software "Microsoft Azure Service Fabric SDK*"
-          Write-Host "--- Uninstalling Azure Service Fabric ---"
-          Uninstall-Software "Microsoft Azure Service Fabric*"
+          Write-Host "--- Uninstalling Azure Service Fabric (300s timeout) ---"
+          Uninstall-Software "Microsoft Azure Service Fabric*" -timeoutSeconds 300
           
           Write-Host "Cleanup completed!"
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.98.8-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          # 使用 winget 安装 Tailscale（比下载 MSI 更可靠，自动处理最新版本和依赖）
+          Write-Host "Installing Tailscale via winget..."
+          $proc = Start-Process -FilePath "winget" -ArgumentList "install", "Tailscale.Tailscale", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+              Write-Error "winget install Tailscale failed with exit code $($proc.ExitCode)"
+              exit 1
+          }
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
           # 将 Tailscale 加入系统 PATH，确保所有用户（包括 liaox）都能使用 tailscale 命令
           $tsPath = [Environment]::GetFolderPath('ProgramFiles') + '\Tailscale'
           $currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
           if ($currentPath -notlike "*$tsPath*") {
               [Environment]::SetEnvironmentVariable('Path', "$currentPath;$tsPath", 'Machine')
           }
+          # 刷新当前会话的 PATH
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+          
           # 确保 Tailscale 服务设为自动启动
           Set-Service -Name Tailscale -StartupType Automatic
+          Write-Host "Tailscale installed successfully."
       - name: Authenticate Tailscale
         run: |
           # 验证 TAILSCALE_AUTH_KEY 是否已配置
@@ -392,23 +399,110 @@ jobs:
       - name: Install and Start llama.cpp
         run: |
           Write-Host "Installing llama.cpp..."
-          # 安装前先建好目标目录，避免安装脚本内部 Remove-Item 因目录不存在而报错
-          $null = New-Item -Path "$env:LOCALAPPDATA\llama-app" -ItemType Directory -Force
-          # 安装 llama.cpp（用 try/catch 兜底，避免脚本内部非关键错误导致整个 step 失败）
-          try {
-              $installScript = Invoke-RestMethod -Uri "https://llama.app/install.ps1"
-              Invoke-Expression $installScript
-          } catch {
-              Write-Warning "llama.cpp installer reported an error (non-critical): $_"
+
+          # ── 方法 1: 通过 llama.app 官方安装脚本 ──
+          function Install-FromLlamaApp {
+              Write-Host "  Method 1: llama.app installer..."
+              $null = New-Item -Path "$env:LOCALAPPDATA\llama-app" -ItemType Directory -Force
+              try {
+                  $installScript = Invoke-RestMethod -Uri "https://llama.app/install.ps1" -ErrorAction Stop
+                  Invoke-Expression $installScript
+                  return $true
+              } catch {
+                  Write-Warning "  llama.app installer failed: $_"
+                  return $false
+              }
           }
-          # 验证 llama.exe 是否可用
+
+          # ── 方法 2: 通过 winget 安装 ──
+          function Install-FromWinget {
+              Write-Host "  Method 2: winget install llama.cpp..."
+              try {
+                  $proc = Start-Process -FilePath "winget" -ArgumentList "install", "llama.cpp", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
+                  if ($proc.ExitCode -eq 0) {
+                      # 刷新 PATH 以便找到新安装的 llama.exe
+                      $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+                      return $true
+                  } else {
+                      Write-Warning "  winget install exited with code $($proc.ExitCode)"
+                      return $false
+                  }
+              } catch {
+                  Write-Warning "  winget install failed: $_"
+                  return $false
+              }
+          }
+
+          # ── 方法 3: 从 GitHub Releases 下载预编译包 ──
+          function Install-FromGitHub {
+              Write-Host "  Method 3: GitHub Releases..."
+              # 先获取最新 release 的 tag
+              try {
+                  $release = Invoke-RestMethod "https://api.github.com/repos/ggerganov/llama.cpp/releases/latest" -ErrorAction Stop
+                  $tag = $release.tag_name
+                  Write-Host "  Latest release: $tag"
+              } catch {
+                  Write-Warning "  Failed to query GitHub releases: $_"
+                  Write-Warning "  Falling back to a known stable version."
+                  $tag = "b5024"
+              }
+
+              # 下载 Windows 版预编译包（包含 llama-server.exe / llama-cli.exe / llama.exe）
+              $zipUrl = "https://github.com/ggerganov/llama.cpp/releases/download/$tag/llama-$tag-bin-win-cuda-x64.zip"
+              $zipPath = "$env:TEMP\llama-cpp.zip"
+              $extractDir = "$env:LOCALAPPDATA\Programs\llama"
+              
+              try {
+                  Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -ErrorAction Stop
+                  Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+                  Remove-Item $zipPath -Force
+                  
+                  # 期望解压后里面有 llama-server.exe 或 llama.exe
+                  if (Test-Path "$extractDir\llama-server.exe") {
+                      # 某些版本主程序叫 llama-server.exe，创建别名
+                      Copy-Item "$extractDir\llama-server.exe" "$extractDir\llama.exe" -Force
+                  } elseif (-not (Test-Path "$extractDir\llama.exe")) {
+                      # 搜索任何可用的 exe
+                      $anyExe = Get-ChildItem "$extractDir\*.exe" | Select-Object -First 1
+                      if ($anyExe) {
+                          Copy-Item $anyExe.FullName "$extractDir\llama.exe" -Force
+                      }
+                  }
+                  
+                  # 加入 PATH
+                  $currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+                  if ($currentPath -notlike "*$extractDir*") {
+                      [Environment]::SetEnvironmentVariable('Path', "$currentPath;$extractDir", 'Machine')
+                  }
+                  $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+                  return $true
+              } catch {
+                  Write-Warning "  GitHub release download failed: $_"
+                  return $false
+              }
+          }
+
+          # ── 按顺序尝试安装 ──
+          $llamaInstalled = Install-FromLlamaApp
+          if (-not $llamaInstalled) {
+              $llamaInstalled = Install-FromWinget
+          }
+          if (-not $llamaInstalled) {
+              $llamaInstalled = Install-FromGitHub
+          }
+
+          # ── 验证 llama.exe ──
           $llamaPath = & where.exe llama.exe 2>$null
           if (-not $llamaPath) {
               $llamaPath = "$env:LOCALAPPDATA\Programs\llama\llama.exe"
-              if (-not (Test-Path $llamaPath)) {
-                  Write-Error "llama.exe not found after installation"
-                  exit 1
-              }
+          }
+          if (-not $llamaPath -or -not (Test-Path $llamaPath)) {
+              # 最后再搜一遍注册的 PATH
+              $llamaPath = (Get-Command llama.exe -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $llamaPath -or -not (Test-Path $llamaPath)) {
+              Write-Error "llama.exe not found after all installation attempts"
+              exit 1
           }
           Write-Host "llama.cpp installed successfully. Path: $llamaPath"
           

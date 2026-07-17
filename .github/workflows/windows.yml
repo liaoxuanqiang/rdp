@@ -58,6 +58,69 @@ jobs:
               Write-Error "User creation failed"
               exit 1
           }
+      - name: Cleanup WinSxS and Uninstall Unnecessary Software
+        run: |
+          # ─── 清理 WinSxS 组件存储 ───
+          Write-Host "=== [1/4] Cleaning WinSxS component store ==="
+          Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase
+          
+          Write-Host "=== [2/4] Analyzing component store after cleanup ==="
+          Dism.exe /online /Cleanup-Image /AnalyzeComponentStore
+          
+          # ─── 清理 Windows Update 缓存 ───
+          Write-Host "=== [3/4] Cleaning Windows Update cache ==="
+          Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+          if (Test-Path "C:\Windows\SoftwareDistribution") {
+              Remove-Item "C:\Windows\SoftwareDistribution\*" -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "SoftwareDistribution cache cleaned."
+          }
+          Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+          
+          # ─── 卸载不必要的软件 ───
+          Write-Host "=== [4/4] Uninstalling unnecessary software ==="
+          
+          # Helper: 从注册表查找并静默卸载软件
+          function Uninstall-Software($namePattern) {
+              $keys = @(
+                  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+              )
+              $items = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like $namePattern }
+              foreach ($item in $items) {
+                  Write-Host "  Found: $($item.DisplayName)"
+                  $uninstallStr = $item.QuietUninstallString
+                  if (-not $uninstallStr) { $uninstallStr = $item.UninstallString }
+                  if (-not $uninstallStr) { continue }
+                  
+                  # 处理 msiexec 格式
+                  if ($uninstallStr -match '(?i)msiexec') {
+                      if ($uninstallStr -match '/I') { continue }  # 跳过安装模式
+                      $args = "/x $($item.PSChildName) /quiet /norestart"
+                      Write-Host "  Running: msiexec $args"
+                      Start-Process msiexec.exe -ArgumentList $args -Wait -NoNewWindow
+                  } else {
+                      # 提取 exe 路径和参数
+                      $parts = if ($uninstallStr -match '^"(.+?)"\s*(.*)') {
+                          @($matches[1], $matches[2])
+                      } elseif ($uninstallStr -match '^(\S+)\s*(.*)') {
+                          @($matches[1], $matches[2])
+                      } else {
+                          @($uninstallStr, '')
+                      }
+                      Write-Host "  Running: $($parts[0]) $($parts[1])"
+                      Start-Process -Wait -FilePath $parts[0] -ArgumentList $parts[1] -NoNewWindow
+                  }
+                  Write-Host "  Uninstalled."
+              }
+              if (-not $items) { Write-Host "  Not found, skipping." }
+          }
+          
+          Uninstall-Software "*Google Chrome*"
+          Uninstall-Software "*Mozilla Firefox*"
+          Uninstall-Software "*Unity Hub*"
+          
+          Write-Host "Cleanup completed!"
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.98.8-amd64.msi"

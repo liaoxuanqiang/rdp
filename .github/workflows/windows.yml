@@ -159,8 +159,12 @@ jobs:
                       $p = Start-Process msiexec.exe -ArgumentList $args -NoNewWindow -PassThru
                       $waited = $p.WaitForExit($timeoutSeconds * 1000)
                       if ($waited) {
-                          if ($p.ExitCode -eq 0) {
-                              Write-Host "  $($item.DisplayName) uninstalled (exit code: 0)."
+                          if ($p.ExitCode -eq 0 -or $p.ExitCode -eq 1605) {
+                              if ($p.ExitCode -eq 0) {
+                                  Write-Host "  $($item.DisplayName) uninstalled (exit code: 0)."
+                              } else {
+                                  Write-Host "  $($item.DisplayName) already uninstalled (exit code: 1605)."
+                              }
                               $succeeded = $true
                               break
                           } elseif ($p.ExitCode -eq 1618) {

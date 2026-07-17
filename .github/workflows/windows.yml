@@ -60,8 +60,11 @@ jobs:
           }
       - name: Uninstall Unnecessary Software
         run: |
-          # ─── 并行卸载不必要的软件 ───
-          Write-Host "=== Uninstalling unnecessary software (parallel) ==="
+          # ─── 卸载不必要的软件（两阶段策略） ───
+          #    Phase 1: 非 MSI 软件 → 真正并行（Chrome / Firefox / Unity Hub）
+          #    Phase 2: MSI 软件 → 串行（因为 msiexec 有全局互斥锁，并行反而更慢）
+          #    Phase 3: Service Fabric CleanFabric → 后台不阻塞
+          Write-Host "=== Uninstalling unnecessary software ==="
           
           function Stop-SoftwareProcesses {
               param([string[]]$ServiceNames, [string[]]$ProcessNames)
@@ -81,7 +84,62 @@ jobs:
               }
           }
 
-          function Uninstall-Software($namePattern, $timeoutSeconds = 60) {
+          # 杀掉所有需要停止的进程
+          Stop-SoftwareProcesses -ServiceNames @("UnityHub", "AzureCosmosDBEmulator", "FabricHostSvc", "FabricInstallerSvc", "FabricGatewaySvc", "FabricApplicationSvc") -ProcessNames @("chrome", "firefox", "Unity Hub", "Unity", "R", "Rgui", "Rscript", "RTerm", "gcc", "make", "sh", "rtools", "aws", "sam", "az", "CosmosDB.Emulator", "FabricHost", "Fabric", "FabricDeployer", "session-manager-plugin")
+
+          # ── Phase 1: 非 MSI 软件（可真正并行，每个设 60s 超时防挂起） ──
+          Write-Host "--- Phase 1: Non-MSI (parallel) ---"
+
+          $chromeJob = Start-Job -Name "Chrome" -ScriptBlock {
+              $items = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like '*Google Chrome*' }
+              foreach ($item in $items) {
+                  if ($item.UninstallString -match 'setup\.exe$') {
+                      $exe = $item.UninstallString -replace '^"(.+?)".*','$1'
+                      Write-Host '--- Chrome ---'
+                      $p = Start-Process -FilePath $exe -ArgumentList '--uninstall --force-uninstall' -NoNewWindow -PassThru
+                      if (-not $p.WaitForExit(60000)) { Write-Warning 'Chrome timed out, killed.'; $p.Kill() }
+                      else { Write-Host '  Chrome uninstalled.' }
+                  }
+              }
+          }
+
+          $firefoxJob = Start-Job -Name "Firefox" -ScriptBlock {
+              $items = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like '*Mozilla Firefox*' }
+              foreach ($item in $items) {
+                  if ($item.UninstallString -match 'helper\.exe') {
+                      $exe = $item.UninstallString -replace '^"(.+?)".*','$1'
+                      Write-Host '--- Firefox ---'
+                      $p = Start-Process -FilePath $exe -ArgumentList '/S' -NoNewWindow -PassThru
+                      if (-not $p.WaitForExit(60000)) { Write-Warning 'Firefox timed out, killed.'; $p.Kill() }
+                      else { Write-Host '  Firefox uninstalled.' }
+                  }
+              }
+          }
+
+          $unityJob = Start-Job -Name "UnityHub" -ScriptBlock {
+              $items = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like '*Unity Hub*' }
+              foreach ($item in $items) {
+                  if ($item.UninstallString) {
+                      $exe = $item.UninstallString -replace '^"(.+?)".*','$1'
+                      $args = $item.UninstallString -replace '^"(.+?)"\s*(.*)','$2'
+                      Write-Host '--- Unity Hub ---'
+                      $p = Start-Process -FilePath $exe -ArgumentList $args -NoNewWindow -PassThru -ErrorAction SilentlyContinue
+                      if ($p -and -not $p.WaitForExit(60000)) { Write-Warning 'Unity Hub timed out, killed.'; $p.Kill() }
+                      elseif ($p) { Write-Host '  Unity Hub uninstalled.' }
+                  }
+              }
+          }
+
+          $chromeJob, $firefoxJob, $unityJob | Wait-Job | Out-Null
+          $chromeJob, $firefoxJob, $unityJob | Receive-Job
+
+          # ── Phase 2: MSI 软件（串行 — msiexec 有全局互斥锁，逐个跑更快） ──
+          Write-Host "--- Phase 2: MSI (sequential — msiexec serializes anyway) ---"
+
+          function Uninstall-Msi($namePattern, $timeoutSeconds = 120) {
               $keys = @(
                   'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
                   'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
@@ -89,79 +147,37 @@ jobs:
               $items = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
                   Where-Object { $_.DisplayName -like $namePattern }
               foreach ($item in $items) {
-                  Write-Host "  Found: $($item.DisplayName)"
-                  $uninstallStr = $item.QuietUninstallString
-                  if (-not $uninstallStr) { $uninstallStr = $item.UninstallString }
-                  if (-not $uninstallStr) { continue }
-                  
-                  if ($uninstallStr -match '(?i)msiexec') {
-                      if ($uninstallStr -match '/I') { continue }
-                      $args = "/x $($item.PSChildName) /quiet /norestart"
-                      Write-Host "  Running: msiexec $args"
-                      Start-Process msiexec.exe -ArgumentList $args -Wait -NoNewWindow
+                  Write-Host "  Found: $($item.DisplayName) — uninstalling..."
+                  $args = "/x $($item.PSChildName) /quiet /norestart"
+                  Write-Host "  Running: msiexec $args"
+                  $p = Start-Process msiexec.exe -ArgumentList $args -NoNewWindow -PassThru
+                  if (-not $p.WaitForExit($timeoutSeconds * 1000)) {
+                      Write-Warning "  Timed out after ${timeoutSeconds}s, killing."
+                      $p.Kill()
                   } else {
-                      $parts = if ($uninstallStr -match '^"(.+?)"\s*(.*)') {
-                          @($matches[1], $matches[2])
-                      } elseif ($uninstallStr -match '^(\S+)\s*(.*)') {
-                          @($matches[1], $matches[2])
-                      } else {
-                          @($uninstallStr, '')
-                      }
-                      if ($parts[0] -match '\\Mozilla Firefox\\uninstall\\helper\.exe$') {
-                          Write-Host "  Detected Firefox helper.exe — appending /S."
-                          $parts[1] = '/S'
-                      } elseif ($parts[0] -match '\\Google\\Chrome\\Application\\.+\\Installer\\setup\.exe$') {
-                          Write-Host "  Detected Chrome setup.exe — --uninstall --force-uninstall."
-                          $parts[1] = '--uninstall --force-uninstall'
-                      }
-                      Write-Host "  Running: $($parts[0]) $($parts[1])"
-                      $timeoutMs = $timeoutSeconds * 1000
-                      $proc = Start-Process -FilePath $parts[0] -ArgumentList $parts[1] -NoNewWindow -PassThru
-                      if (-not $proc.WaitForExit($timeoutMs)) {
-                          Write-Warning "  Timed out after ${timeoutSeconds}s, killing."
-                          $proc.Kill()
-                      }
+                      Write-Host "  $($item.DisplayName) uninstalled (exit code: $($p.ExitCode))."
                   }
-                  Write-Host "  Uninstalled."
               }
-              if (-not $items) { Write-Host "  Not found, skipping." }
+              if (-not $items) { Write-Host "  $namePattern not found, skipping." }
           }
 
-          # 先杀掉所有需要停止的进程
-          Stop-SoftwareProcesses -ServiceNames @("UnityHub", "AzureCosmosDBEmulator", "FabricHostSvc", "FabricInstallerSvc", "FabricGatewaySvc", "FabricApplicationSvc") -ProcessNames @("chrome", "firefox", "Unity Hub", "Unity", "R", "Rgui", "Rscript", "RTerm", "gcc", "make", "sh", "rtools", "aws", "sam", "az", "CosmosDB.Emulator", "FabricHost", "Fabric", "FabricDeployer", "session-manager-plugin")
+          Uninstall-Msi -namePattern 'R for Windows*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'Rtools*' -timeoutSeconds 300
+          Uninstall-Msi -namePattern 'AWS Command Line Interface*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'Microsoft Azure CLI*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'AWS SAM*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'Session Manager Plugin*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'Azure Cosmos DB Emulator*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'Microsoft Azure Service Fabric SDK*' -timeoutSeconds 120
 
-          # 并行卸载互不依赖的软件包（用 Start-Job 加速）
-          $jobs = @()
-
-          $jobs += Start-Job -Name "Chrome" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- Chrome ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Google Chrome*' } | ForEach-Object { if ($_.UninstallString -match 'setup\.exe$') { Start-Process ($_.UninstallString -replace '^"(.+?)".*','$1') -ArgumentList '--uninstall --force-uninstall' -Wait; Write-Host '  Chrome uninstalled.' } })"
-          $jobs += Start-Job -Name "Firefox" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- Firefox ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Mozilla Firefox*' } | ForEach-Object { if ($_.UninstallString -match 'helper\.exe') { Start-Process ($_.UninstallString -replace '^"(.+?)".*','$1') -ArgumentList '/S' -Wait; Write-Host '  Firefox uninstalled.' } })"
-          $jobs += Start-Job -Name "R" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- R for Windows ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'R for Windows*' } | ForEach-Object { Start-Process msiexec.exe -ArgumentList \"/x $($_.PSChildName) /quiet /norestart\" -Wait; Write-Host '  R uninstalled.' })"
-          $jobs += Start-Job -Name "Rtools" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- Rtools (300s) ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Rtools*' } | ForEach-Object { Start-Process msiexec.exe -ArgumentList \"/x $($_.PSChildName) /quiet /norestart\" -Wait; Write-Host '  Rtools uninstalled.' })"
-          $jobs += Start-Job -Name "Unity" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- Unity Hub ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Unity Hub*' } | ForEach-Object { if ($_.UninstallString) { Start-Process ($_.UninstallString -replace '^"(.+?)".*','$1') -ArgumentList ($_.UninstallString -replace '^"(.+?)"\s*(.*)','$2') -Wait -ErrorAction SilentlyContinue; Write-Host '  Unity Hub uninstalled.' } })"
-          $jobs += Start-Job -Name "AWS" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- AWS CLI ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'AWS Command Line Interface*' } | ForEach-Object { Start-Process msiexec.exe -ArgumentList \"/x $($_.PSChildName) /quiet /norestart\" -Wait; Write-Host '  AWS CLI uninstalled.' })"
-          $jobs += Start-Job -Name "AzureCLI" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- Azure CLI ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Microsoft Azure CLI*' } | ForEach-Object { Start-Process msiexec.exe -ArgumentList \"/x $($_.PSChildName) /quiet /norestart\" -Wait; Write-Host '  Azure CLI uninstalled.' })"
-
-          # AWS SAM / Session Manager / Cosmos DB / Service Fabric SDK / Azure Service Fabric 放后台
-          $bgJobs = @()
-          $bgJobs += Start-Job -Name "AWSSAM" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- AWS SAM ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'AWS SAM*' } | ForEach-Object { Start-Process msiexec.exe -ArgumentList \"/x $($_.PSChildName) /quiet /norestart\" -Wait })"
-          $bgJobs += Start-Job -Name "SessMgr" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- Session Manager ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Session Manager Plugin*' } | ForEach-Object { Start-Process msiexec.exe -ArgumentList \"/x $($_.PSChildName) /quiet /norestart\" -Wait })"
-          $bgJobs += Start-Job -Name "CosmosDB" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- Cosmos DB ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Azure Cosmos DB Emulator*' } | ForEach-Object { if ($_.UninstallString) { Start-Process ($_.UninstallString -replace '^"(.+?)".*','$1') -ArgumentList '--quiet' -Wait -ErrorAction SilentlyContinue } })"
-          $bgJobs += Start-Job -Name "FabricSDK" -ScriptBlock { param($p) Invoke-Expression $p } -ArgumentList "Write-Host '--- Service Fabric SDK ---'; $(Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like 'Microsoft Azure Service Fabric SDK*' } | ForEach-Object { Start-Process msiexec.exe -ArgumentList \"/x $($_.PSChildName) /quiet /norestart\" -Wait })"
-
-          # Service Fabric CleanFabric 后台跑
+          # ── Phase 3: Service Fabric CleanFabric（后台，不阻塞流程） ──
+          Write-Host "--- Phase 3: Service Fabric CleanFabric (background) ---"
           $cleanFabricPath = "C:\Program Files\Microsoft Service Fabric\bin\Fabric\Fabric.Code\CleanFabric.ps1"
           if (Test-Path $cleanFabricPath) {
               Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$cleanFabricPath`"" -WindowStyle Hidden
               Write-Host "  Azure Service Fabric 卸载已在后台启动。"
           }
 
-          # 等待主要前台作业完成
-          Write-Host "等待主要卸载任务完成..."
-          $jobs | Wait-Job | Out-Null
-          $jobs | Receive-Job | Write-Host
-
-          # 后台作业不等待，让它们继续
-          Write-Host "后台卸载任务（AWS SAM、Session Manager、Cosmos DB、Service Fabric）继续运行中。"
           Write-Host "Cleanup completed!"
       - name: Install Tailscale, Authenticate, Configure & Parallel Model Download
         env:

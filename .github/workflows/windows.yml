@@ -139,6 +139,10 @@ jobs:
           Uninstall-Software "*Mozilla Firefox*"
           Write-Host "--- Uninstalling Unity Hub ---"
           Uninstall-Software "*Unity Hub*"
+          Write-Host "--- Uninstalling R for Windows ---"
+          Uninstall-Software "R for Windows*"
+          Write-Host "--- Uninstalling Rtools ---"
+          Uninstall-Software "Rtools*"
           
           Write-Host "Cleanup completed!"
       - name: Install Tailscale

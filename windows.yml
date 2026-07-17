@@ -1,0 +1,535 @@
+name: windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # 启用远程桌面，禁用网络级身份认证（如需）
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+          # 删除已有同名规则避免重复
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # 测试用：允许所有 3389 端口的入站连接
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          
+          # 放行 8080 端口（HTTP 服务）
+          netsh advfirewall firewall delete rule name="Tailscale-8080"
+          netsh advfirewall firewall add rule name="Tailscale-8080" `
+            dir=in action=allow protocol=TCP localport=8080
+          # （可选）重启远程桌面服务使变更生效
+          Restart-Service -Name TermService -Force
+      - name: Create RDP User with Secure Password
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # 验证 RDP_USERNAME 是否已配置
+          if (-not $env:RDP_USERNAME) {
+              Write-Error "RDP_USERNAME is not configured in GitHub Secrets. Please add it."
+              exit 1
+          }
+          Write-Host "RDP_USERNAME is configured: $env:RDP_USERNAME"
+          # 验证 RDP_PASSWORD 是否已配置
+          if (-not $env:RDP_PASSWORD) {
+              Write-Error "RDP_PASSWORD is not configured in GitHub Secrets. Please add it."
+              exit 1
+          }
+          Write-Host "RDP_PASSWORD is configured."
+          # 直接使用来自 Secrets 的密码创建用户
+          $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME
+          
+          if (-not (Get-LocalUser -Name $env:RDP_USERNAME)) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+      - name: Uninstall Unnecessary Software
+        run: |
+          # ─── 卸载不必要的软件（两阶段策略） ───
+          #    Phase 1: 非 MSI 软件 → 真正并行（Chrome / Firefox / Unity Hub）
+          #    Phase 2: MSI 软件 → 串行（因为 msiexec 有全局互斥锁，并行反而更慢）
+          #    Phase 3: Service Fabric CleanFabric → 后台不阻塞
+          Write-Host "=== Uninstalling unnecessary software ==="
+          
+          function Stop-SoftwareProcesses {
+              param([string[]]$ServiceNames, [string[]]$ProcessNames)
+              foreach ($svc in $ServiceNames) {
+                  $existing = Get-Service -Name $svc -ErrorAction SilentlyContinue
+                  if ($existing -and $existing.Status -eq 'Running') {
+                      Write-Host "  Stopping service: $svc"
+                      Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                  }
+              }
+              foreach ($proc in $ProcessNames) {
+                  $running = Get-Process -Name $proc -ErrorAction SilentlyContinue
+                  if ($running) {
+                      Write-Host "  Killing process: $proc"
+                      Stop-Process -Name $proc -Force -ErrorAction SilentlyContinue
+                  }
+              }
+          }
+
+          # 杀掉所有需要停止的进程
+          Stop-SoftwareProcesses -ServiceNames @("UnityHub", "AzureCosmosDBEmulator", "FabricHostSvc", "FabricInstallerSvc", "FabricGatewaySvc", "FabricApplicationSvc") -ProcessNames @("chrome", "firefox", "Unity Hub", "Unity", "R", "Rgui", "Rscript", "RTerm", "gcc", "make", "sh", "rtools", "aws", "sam", "az", "CosmosDB.Emulator", "FabricHost", "Fabric", "FabricDeployer", "session-manager-plugin")
+
+          # 先杀掉所有残留的 msiexec 进程，释放 MSI 锁
+          Get-Process -Name "msiexec" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+
+          # ── Phase 1: 非 MSI 软件（可真正并行，每个设 60s 超时防挂起） ──
+          Write-Host "--- Phase 1: Non-MSI (parallel) ---"
+
+          $chromeJob = Start-Job -Name "Chrome" -ScriptBlock {
+              $items = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like '*Google Chrome*' }
+              foreach ($item in $items) {
+                  if ($item.UninstallString -match 'setup\.exe$') {
+                      $exe = $item.UninstallString -replace '^"(.+?)".*','$1'
+                      Write-Host '--- Chrome ---'
+                      $p = Start-Process -FilePath $exe -ArgumentList '--uninstall --force-uninstall' -NoNewWindow -PassThru
+                      if (-not $p.WaitForExit(60000)) { Write-Warning 'Chrome timed out, killed.'; $p.Kill() }
+                      else { Write-Host '  Chrome uninstalled.' }
+                  }
+              }
+          }
+
+          $firefoxJob = Start-Job -Name "Firefox" -ScriptBlock {
+              $items = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like '*Mozilla Firefox*' }
+              foreach ($item in $items) {
+                  if ($item.UninstallString -match 'helper\.exe') {
+                      $exe = $item.UninstallString -replace '^"(.+?)".*','$1'
+                      Write-Host '--- Firefox ---'
+                      $p = Start-Process -FilePath $exe -ArgumentList '/S' -NoNewWindow -PassThru
+                      if (-not $p.WaitForExit(60000)) { Write-Warning 'Firefox timed out, killed.'; $p.Kill() }
+                      else { Write-Host '  Firefox uninstalled.' }
+                  }
+              }
+          }
+
+          $unityJob = Start-Job -Name "UnityHub" -ScriptBlock {
+              $items = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like '*Unity Hub*' }
+              foreach ($item in $items) {
+                  if ($item.UninstallString) {
+                      $exe = $item.UninstallString -replace '^"(.+?)".*','$1'
+                      $args = $item.UninstallString -replace '^"(.+?)"\s*(.*)','$2'
+                      Write-Host '--- Unity Hub ---'
+                      $p = Start-Process -FilePath $exe -ArgumentList $args -NoNewWindow -PassThru -ErrorAction SilentlyContinue
+                      if ($p -and -not $p.WaitForExit(60000)) { Write-Warning 'Unity Hub timed out, killed.'; $p.Kill() }
+                      elseif ($p) { Write-Host '  Unity Hub uninstalled.' }
+                  }
+              }
+          }
+
+          $chromeJob, $firefoxJob, $unityJob | Wait-Job | Out-Null
+          $chromeJob, $firefoxJob, $unityJob | Receive-Job
+
+          # ── Phase 2: MSI 软件（串行 — msiexec 有全局互斥锁，逐个跑更快） ──
+          Write-Host "--- Phase 2: MSI (sequential — msiexec serializes anyway) ---"
+
+          function Uninstall-Msi($namePattern, $timeoutSeconds = 120) {
+              $keys = @(
+                  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+                  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+              )
+              $items = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like $namePattern -and $_.PSChildName -match '^\{' }
+              foreach ($item in $items) {
+                  Write-Host "  Found: $($item.DisplayName) (MSI: $($item.PSChildName)) — uninstalling..."
+                  $args = "/x $($item.PSChildName) /quiet /norestart"
+                  $succeeded = $false
+                  for ($attempt = 1; $attempt -le 3; $attempt++) {
+                      Write-Host "  Attempt $attempt: msiexec $args"
+                      $p = Start-Process msiexec.exe -ArgumentList $args -NoNewWindow -PassThru
+                      $waited = $p.WaitForExit($timeoutSeconds * 1000)
+                      if ($waited) {
+                          if ($p.ExitCode -eq 0) {
+                              Write-Host "  $($item.DisplayName) uninstalled (exit code: 0)."
+                              $succeeded = $true
+                              break
+                          } elseif ($p.ExitCode -eq 1618) {
+                              Write-Warning "  Exit code 1618 (another install in progress). Waiting 10s, retrying..."
+                              Start-Sleep -Seconds 10
+                          } else {
+                              Write-Warning "  Exit code $($p.ExitCode). Retrying..."
+                              Start-Sleep -Seconds 5
+                          }
+                      } else {
+                          Write-Warning "  Timed out after ${timeoutSeconds}s, killing process."
+                          $p.Kill()
+                          # 重置 MSI Installer 状态
+                          Start-Sleep -Seconds 2
+                      }
+                  }
+                  if (-not $succeeded) {
+                      Write-Warning "  $($item.DisplayName) 卸载失败（已重试 3 次）。"
+                  }
+              }
+              # 处理非 MSI 安装（InnoSetup 等），通过 UninstallString 直接运行
+              $nonMsiItems = Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+                  Where-Object { $_.DisplayName -like $namePattern -and $_.PSChildName -notmatch '^\{' -and $_.UninstallString }
+              foreach ($item in $nonMsiItems) {
+                  Write-Host "  Found: $($item.DisplayName) (Non-MSI)" — uninstalling via UninstallString..."
+                  $ustr = $item.UninstallString -replace '^"(.+?)"\s*(.*)','$1 $2'
+                  Write-Host "  Running: $ustr"
+                  $p = Start-Process cmd.exe -ArgumentList "/c `"$ustr /SILENT /SUPPRESSMSGBOXES`"" -NoNewWindow -PassThru
+                  if (-not $p.WaitForExit(60000)) { Write-Warning "  Timed out, killed."; $p.Kill() }
+                  else { Write-Host "  $($item.DisplayName) uninstalled (exit: $($p.ExitCode))." }
+              }
+              if (-not $items -and -not $nonMsiItems) { Write-Host "  $namePattern not found, skipping." }
+          }
+
+          Uninstall-Msi -namePattern 'R for Windows*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'AWS Command Line Interface*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'Microsoft Azure CLI*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'AWS SAM*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'Session Manager Plugin*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'Azure Cosmos DB Emulator*' -timeoutSeconds 120
+          Uninstall-Msi -namePattern 'Microsoft Azure Service Fabric SDK*' -timeoutSeconds 120
+
+          # ── Phase 3: 慢速卸装后台跑（不阻塞后续步骤） ──
+          Write-Host "--- Phase 3: Slow uninstallers (background, non-blocking) ---"
+
+          # Rtools（已知很慢，后台不阻塞）
+          $rtoolsItems = Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like 'Rtools*' }
+          if ($rtoolsItems) {
+              foreach ($item in $rtoolsItems) {
+                  Write-Host "  Rtools found, uninstalling in background (PID below)..."
+                  Start-Process msiexec.exe -ArgumentList "/x $($item.PSChildName) /quiet /norestart" -NoNewWindow
+              }
+          } else { Write-Host "  Rtools not found, skipping." }
+
+          # CleanFabric（Azure Service Fabric 清理）
+          $cleanFabricPath = "C:\Program Files\Microsoft Service Fabric\bin\Fabric\Fabric.Code\CleanFabric.ps1"
+          if (Test-Path $cleanFabricPath) {
+              Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$cleanFabricPath`"" -WindowStyle Hidden
+              Write-Host "  Azure Service Fabric 卸载已在后台启动。"
+          }
+
+          Write-Host "Cleanup completed!"
+      - name: Install Tailscale, Authenticate, Configure & Parallel Model Download
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TAILSCALE_API_TOKEN: ${{ secrets.TAILSCALE_API_TOKEN }}
+        run: |
+          # ════════════════════════════════════════════
+          # 1. 安装 Tailscale
+          # ════════════════════════════════════════════
+          Write-Host "Installing Tailscale via winget..."
+          $proc = Start-Process -FilePath "winget" -ArgumentList "install", "Tailscale.Tailscale", "--source", "winget", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { Write-Error "winget install Tailscale failed"; exit 1 }
+          $tsPath = [Environment]::GetFolderPath('ProgramFiles') + '\Tailscale'
+          $currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($currentPath -notlike "*$tsPath*") {
+              [Environment]::SetEnvironmentVariable('Path', "$currentPath;$tsPath", 'Machine')
+          }
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+          Set-Service -Name Tailscale -StartupType Automatic
+          Write-Host "Tailscale installed."
+
+          # ════════════════════════════════════════════
+          # 2. 认证 Tailscale + 并行启动模型下载
+          # ════════════════════════════════════════════
+          if ("$env:TAILSCALE_AUTH_KEY" -eq "") { Write-Error "TAILSCALE_AUTH_KEY missing"; exit 1 }
+          Write-Host "Authenticating Tailscale..."
+          & "$tsPath\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=windows
+          
+          # 等待 Tailscale 分配 IP（同时启动模型下载）
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$tsPath\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned."; & "$tsPath\tailscale.exe" status; exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+          # ════════════════════════════════════════════
+          # 3. Tailscale API 操作（清理旧设备 + 设置名称 + MagicDNS + 子网路由）
+          # ════════════════════════════════════════════
+          if ("$env:TAILSCALE_API_TOKEN" -ne "") {
+              $apiBase = "https://api.tailscale.com/api/v2"
+              $headers = @{ "Authorization" = "Bearer $env:TAILSCALE_API_TOKEN" }
+              
+              # 获取设备 ID
+              $statusJson = & "$tsPath\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+              $deviceId = $statusJson.Self.ID
+              
+              if ($deviceId) {
+                  try {
+                      # 清理旧 windows 设备
+                      $allDevices = Invoke-RestMethod -Uri "$apiBase/tailnet/-/devices" -Method Get -Headers $headers
+                      $currentApi = $allDevices.devices | Where-Object { $_.nodeId -eq $deviceId }
+                      if ($currentApi) { $deviceId = $currentApi.id }
+                      
+                      $allDevices.devices | Where-Object { $_.hostname -eq "windows" -and $_.id -ne $deviceId } | ForEach-Object {
+                          Write-Host "  Cleaning old device: $($_.name) (ID: $($_.id))"
+                          try { Invoke-RestMethod -Uri "$apiBase/device/$($_.id)/authorized" -Method Post -Headers $headers -Body (@{ "authorized" = $false } | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop } catch {}
+                          try { Invoke-RestMethod -Uri "$apiBase/device/$($_.id)" -Method Delete -Headers $headers -ErrorAction Stop } catch {}
+                      }
+                      # 设置主机名
+                      Invoke-RestMethod -Uri "$apiBase/device/$deviceId/name" -Method Post -Headers $headers -Body (@{ "name" = "windows" } | ConvertTo-Json) -ContentType "application/json" -ErrorAction Stop
+                      Write-Host "  Machine name set to 'windows'."
+                  } catch { Write-Warning "  API operation failed (non-critical): $_" }
+
+                  # MagicDNS
+                  try {
+                      $settings = Invoke-RestMethod -Uri "$apiBase/tailnet/-/settings" -Method Get -Headers $headers
+                      if ($settings.magicDNSEnabled -eq $false) {
+                          Invoke-RestMethod -Uri "$apiBase/tailnet/-/settings" -Method Patch -Headers $headers -Body (@{ "magicDNSEnabled" = $true } | ConvertTo-Json) -ContentType "application/json"
+                          Write-Host "  MagicDNS enabled."
+                      }
+                      $tailnetDomain = (& "$tsPath\tailscale.exe" status --json 2>$null | ConvertFrom-Json).MagicDNSSuffix
+                      if ($tailnetDomain) {
+                          echo "TAILSCALE_DNS=windows.$tailnetDomain" >> $env:GITHUB_ENV
+                          Write-Host "  MagicDNS: windows.$tailnetDomain"
+                      }
+                  } catch { Write-Warning "  MagicDNS check failed (non-critical): $_" }
+              }
+
+              # 重新读取最终 IP
+              $actualIP = & "$tsPath\tailscale.exe" ip -4
+              if ($actualIP) { echo "TAILSCALE_IP=$actualIP" >> $env:GITHUB_ENV }
+          }
+
+          # ════════════════════════════════════════════
+          # 4. 子网路由 + Exit Node
+          # ════════════════════════════════════════════
+          $localIPs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' -and $_.InterfaceAlias -ne 'Tailscale' }
+          $subnets = @()
+          foreach ($ip in $localIPs) {
+              $ipBytes = [System.Net.IPAddress]::Parse($ip.IPAddress).GetAddressBytes()
+              [Array]::Reverse($ipBytes)
+              $ipInt = [System.BitConverter]::ToUInt32($ipBytes, 0)
+              $maskInt = [uint32]::MaxValue -shl (32 - $ip.PrefixLength)
+              $netInt = $ipInt -band $maskInt
+              $netBytes = [System.BitConverter]::GetBytes($netInt)
+              [Array]::Reverse($netBytes)
+              $subnets += "$([System.Net.IPAddress]::new($netBytes).IPAddressToString)/$($ip.PrefixLength)"
+          }
+          & "$tsPath\tailscale.exe" set --advertise-routes="$($subnets -join ',')" --advertise-exit-node --accept-routes --accept-dns=false 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Warning "tailscale set 返回 $LASTEXITCODE（需控制台审批）" }
+
+          Write-Host "Tailscale 配置完成！IP: $tsIP"
+
+          # ════════════════════════════════════════════
+          # 5. 并行：此时 Tailscale 已全部配好，RDP 可用，开始安装 llama.cpp + 下载模型
+          #    但为了不阻塞 RDP 连接，在 Maintain Connection 步骤之前做完即可
+          # ════════════════════════════════════════════
+          Write-Host "=== Tailscale 配置完成 ==="
+      - name: Install and Start llama.cpp
+        run: |
+          Write-Host "Installing llama.cpp via winget..."
+
+          # ── winget 安装 llama.cpp（仅 winget 源，避免 msstore 协议确认） ──
+          $proc = Start-Process -FilePath "winget" -ArgumentList "install", "llama.cpp", "--source", "winget", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+              Write-Error "winget install llama.cpp failed with exit code $($proc.ExitCode)"
+              exit 1
+          }
+          Write-Host "llama.cpp installed via winget."
+
+          # 刷新 PATH
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+
+          # ── 查找 llama.exe ──
+          $llamaPath = & where.exe llama.exe 2>$null
+          if (-not $llamaPath) {
+              $llamaPath = (Get-Command llama.exe -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $llamaPath -or -not (Test-Path $llamaPath)) {
+              Write-Error "llama.exe not found after winget install"
+              exit 1
+          }
+          Write-Host "llama.cpp installed. Path: $llamaPath"
+
+          # 将 llama 目录写入系统 PATH
+          $llamaDir = Split-Path $llamaPath -Parent
+          $currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($currentPath -notlike "*$llamaDir*") {
+              [Environment]::SetEnvironmentVariable('Path', "$currentPath;$llamaDir", 'Machine')
+              Write-Host "Added $llamaDir to system PATH."
+          }
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
+
+          # ── 使用 llama download 下载模型到共享路径（替换旧版 WebClient 下载） ──
+          Write-Host "Downloading MiniCPM5-1B-F16.gguf via llama download..."
+
+          $modelDir = "C:\ProgramData\llama-models"
+          $null = New-Item -Path $modelDir -ItemType Directory -Force
+          # 确保 Everyone 可读
+          icacls $modelDir /grant "Everyone:(OI)(CI)R" /T /Q 2>$null
+
+          $modelPath = "$modelDir\MiniCPM5-1B-F16.gguf"
+
+          # 先启动 serve 服务（暂不加载模型），然后并行下载
+          # 步骤 1: 注册 Windows 服务（不含 --model，先让服务跑起来）
+          Write-Host "Step 1: Registering llama service (without model)..."
+
+          $llamaLog = "$env:ProgramData\llama-models\llama-server.log"
+          $null = New-Item -Path "$env:ProgramData\llama-models" -ItemType Directory -Force
+
+          $existing = Get-Service -Name "llama" -ErrorAction SilentlyContinue
+          if ($existing) {
+              sc.exe stop llama 2>$null
+              sc.exe delete llama 2>$null
+              Start-Sleep -Seconds 2
+          }
+
+          # 第一次注册：不带 --model，仅启动 HTTP 端口
+          $binaryPathNoModel = "`"$llamaPath`" serve --port 8080 --host 0.0.0.0"
+          New-Service -Name "llama" `
+              -BinaryPathName $binaryPathNoModel `
+              -StartupType Automatic `
+              -DisplayName "llama.cpp Server" `
+              -Description "llama.cpp inference server"
+          sc.exe failure llama reset= 86400 actions= restart/5000/restart/10000/restart/30000
+          sc.exe start llama
+          Write-Host "  llama service started (no model)."
+
+          # 步骤 2: 使用 llama download 命令下载模型
+          Write-Host "Step 2: Downloading model with 'llama download'..."
+          & $llamaPath download --hf-repo openbmb/MiniCPM5-1B-GGUF --hf-file MiniCPM5-1B-F16.gguf --output-dir "$modelDir"
+          $downloadExit = $LASTEXITCODE
+
+          if ($downloadExit -ne 0 -or -not (Test-Path $modelPath) -or (Get-Item $modelPath).Length -eq 0) {
+              Write-Warning "  llama download failed (exit: $downloadExit). Model file: $(if(Test-Path $modelPath){'exists but may be invalid'}else{'not found'})"
+              # 回退：用 WebClient 下载
+              Write-Host "  Falling back: downloading with WebClient..."
+              $modelUrl = "https://huggingface.co/openbmb/MiniCPM5-1B-GGUF/resolve/main/MiniCPM5-1B-F16.gguf"
+              $retries = 0; $maxRetries = 3; $downloaded = $false
+              while (-not $downloaded -and $retries -lt $maxRetries) {
+                  try {
+                      Write-Host "    Attempt $($retries + 1) of $maxRetries..."
+                      $wc = New-Object System.Net.WebClient
+                      $wc.DownloadFile($modelUrl, $modelPath)
+                      $wc.Dispose()
+                      if ((Get-Item $modelPath -ErrorAction SilentlyContinue).Length -gt 0) {
+                          $localMB = [math]::Round((Get-Item $modelPath).Length / 1MB, 2)
+                          Write-Host "    Downloaded! Size: $localMB MB"; $downloaded = $true
+                      }
+                  } catch { Write-Warning "    Download failed: $_"; Remove-Item $modelPath -Force -ErrorAction SilentlyContinue }
+                  $retries++
+              }
+              if (-not $downloaded) { Write-Error "Model download failed after fallback."; exit 1 }
+          } else {
+              $localMB = [math]::Round((Get-Item $modelPath).Length / 1MB, 2)
+              Write-Host "  Model downloaded via llama download! Size: $localMB MB"
+          }
+          Write-Host "Model ready at: $modelPath"
+
+          # 步骤 3: 停止服务，更新二进制路径以包含 --model，重新启动
+          Write-Host "Step 3: Updating service to load model..."
+          sc.exe stop llama
+          Start-Sleep -Seconds 3
+          sc.exe delete llama
+          Start-Sleep -Seconds 2
+
+          $binaryPathWithModel = "`"$llamaPath`" serve --port 8080 --host 0.0.0.0 --model `"$modelPath`""
+          New-Service -Name "llama" `
+              -BinaryPathName $binaryPathWithModel `
+              -StartupType Automatic `
+              -DisplayName "llama.cpp Server" `
+              -Description "llama.cpp inference server with MiniCPM5-1B model"
+          sc.exe failure llama reset= 86400 actions= restart/5000/restart/10000/restart/30000
+          sc.exe start llama
+
+          # 等待最多 30 秒让服务启动
+          Write-Host "Waiting for llama service to start..."
+          $timeout = 30
+          $elapsed = 0
+          do {
+              Start-Sleep -Seconds 3
+              $elapsed += 3
+              $listening = netstat -an | Select-String ":8080.*LISTENING"
+              if ($listening) { break }
+              $svc = Get-Service -Name "llama" -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -eq 'Stopped') {
+                  Write-Error "llama service stopped unexpectedly."
+                  $svcLog = "$env:ProgramData\llama-models\llama-server.log"
+                  if (Test-Path $svcLog) { Get-Content $svcLog -Tail 20 -ErrorAction SilentlyContinue }
+                  exit 1
+              }
+              Write-Host "  Waiting for llama serve... ${elapsed}s"
+          } while ($elapsed -lt $timeout)
+
+          if ($listening) {
+              Write-Host "llama.cpp serve is listening on 0.0.0.0:8080 (Windows Service, with model)."
+          } else {
+              Write-Warning "llama.cpp serve still not listening after ${timeout}s, but service is running."
+          }
+      - name: Maintain Connection
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host "`n=== RDP + llama.cpp 服务已就绪 ==="
+          Write-Host "RDP Address (Tailscale IP): $env:TAILSCALE_IP"
+          if ($env:TAILSCALE_DNS) {
+              Write-Host "RDP Address (MagicDNS):    $env:TAILSCALE_DNS"
+          }
+          Write-Host "llama.cpp API:              http://$env:TAILSCALE_IP`:8080"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "===================================`n"
+
+          # 检查 llama 服务是否正在运行（Windows Service，跨会话）
+          $llamaSvc = Get-Service -Name "llama" -ErrorAction SilentlyContinue
+          if ($llamaSvc -and $llamaSvc.Status -eq 'Running') {
+              Write-Host "llama 服务正在运行 (Windows Service)。"
+          } else {
+              Write-Warning "llama 服务未运行，尝试重新启动服务..."
+              if ($llamaSvc) {
+                  sc.exe start llama 2>$null
+              } else {
+                  # 服务不存在，尝试注册并启动
+                  $llamaPath = & where.exe llama.exe 2>$null
+                  if (-not $llamaPath) {
+                      $llamaPath = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\llama.exe"
+                  }
+                  if (Test-Path $llamaPath) {
+                      $modelPath = "C:\ProgramData\llama-models\MiniCPM5-1B-F16.gguf"
+                      $binaryPath = "`"$llamaPath`" serve --port 8080 --host 0.0.0.0 --model `"$modelPath`""
+                      New-Service -Name "llama" -BinaryPathName $binaryPath -StartupType Automatic -DisplayName "llama.cpp Server"
+                      sc.exe failure llama reset= 86400 actions= restart/5000/restart/10000/restart/30000
+                      sc.exe start llama
+                  }
+              }
+              Write-Host "  llama 服务已触发启动。"
+          }
+
+          # 验证端口可访问
+          Write-Host "Verifying llama service on 127.0.0.1:8080..."
+          try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:8080" -TimeoutSec 5 -UseBasicParsing
+              Write-Host "  HTTP 响应: $($r.StatusCode)"
+          } catch {
+              Write-Warning "  127.0.0.1:8080 暂时不可用（可能仍在加载模型）：$_"
+          }
+
+          # 保持 runner 持续运行
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }

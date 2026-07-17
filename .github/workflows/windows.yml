@@ -126,8 +126,8 @@ jobs:
           Uninstall-Software "*Unity Hub*"
           Write-Host "--- Uninstalling R for Windows ---"
           Uninstall-Software "R for Windows*"
-          Write-Host "--- Uninstalling Rtools ---"
-          Uninstall-Software "Rtools*"
+          Write-Host "--- Uninstalling Rtools (120s timeout) ---"
+          Uninstall-Software "Rtools*" -timeoutSeconds 120
           Write-Host "--- Uninstalling AWS CLI ---"
           Uninstall-Software "AWS Command Line Interface*"
           Write-Host "--- Uninstalling AWS SAM CLI ---"

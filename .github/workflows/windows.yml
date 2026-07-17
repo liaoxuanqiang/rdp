@@ -344,30 +344,32 @@ jobs:
           $llamaLog = "$env:LOCALAPPDATA\llama-app\llama-server.log"
           $null = New-Item -Path "$env:LOCALAPPDATA\llama-app" -ItemType Directory -Force
 
-          # winget 安装的 llama.cpp 主程序是 llama.exe，serve 子命令启动 server
-          $proc = Start-Process -FilePath $llamaPath -ArgumentList "serve --port 8080 --host 0.0.0.0" -NoNewWindow -PassThru -RedirectStandardOutput $llamaLog -RedirectStandardError "$llamaLog.err"
+          # 使用 -WindowStyle Hidden 代替 -NoNewWindow 让进程脱离控制台，
+          # 避免 step 结束 PowerShell 退出时连带杀掉子进程
+          $proc = Start-Process -FilePath $llamaPath -ArgumentList "serve --port 8080 --host 0.0.0.0" -WindowStyle Hidden -PassThru -RedirectStandardOutput $llamaLog -RedirectStandardError "$llamaLog.err"
           Write-Host "  PID: $($proc.Id), log: $llamaLog"
 
-          # 等待 5 秒确认服务启动
-          Start-Sleep -Seconds 5
+          # 等待最多 30 秒让服务启动
+          $timeout = 30
+          $elapsed = 0
+          do {
+              Start-Sleep -Seconds 3
+              $elapsed += 3
+              $listening = netstat -an | Select-String ":8080.*LISTENING"
+              if ($listening) { break }
+              if ($proc.HasExited) {
+                  $logContent = Get-Content $llamaLog -Tail 10 -ErrorAction SilentlyContinue
+                  Write-Error "llama.cpp serve exited early (code $($proc.ExitCode)). Last log: $logContent"
+                  exit 1
+              }
+              Write-Host "  Waiting for llama serve... ${elapsed}s"
+          } while ($elapsed -lt $timeout)
 
-          $netstatResult = netstat -an | Select-String ":8080.*LISTENING"
-          if ($netstatResult) {
+          if ($listening) {
               Write-Host "llama.cpp serve is listening on 0.0.0.0:8080."
           } else {
-              Write-Warning "llama.cpp serve may not be listening yet. Checking process..."
-              if ($proc.HasExited) {
-                  $exitCode = $proc.ExitCode
-                  $logContent = Get-Content $llamaLog -Tail 10 -ErrorAction SilentlyContinue
-                  Write-Error "llama.cpp serve exited with code $exitCode. Last log lines: $logContent"
-                  exit 1
-              } else {
-                  Write-Host "Process is still running (PID $($proc.Id)), waiting..."
-                  Start-Sleep -Seconds 10
-              }
+              Write-Warning "llama.cpp serve still not listening after ${timeout}s, but process is alive."
           }
-
-          Write-Host "llama.cpp server started on 0.0.0.0:8080."
       - name: Download MiniCPM5-1B GGUF Model
         run: |
           Write-Host "Downloading MiniCPM5-1B-F16.gguf from Hugging Face..."

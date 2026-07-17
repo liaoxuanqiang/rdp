@@ -148,7 +148,7 @@ jobs:
         run: |
           # 使用 winget 安装 Tailscale（比下载 MSI 更可靠，自动处理最新版本和依赖）
           Write-Host "Installing Tailscale via winget..."
-          $proc = Start-Process -FilePath "winget" -ArgumentList "install", "Tailscale.Tailscale", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
+          $proc = Start-Process -FilePath "winget" -ArgumentList "install", "Tailscale.Tailscale", "--source", "winget", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
           if ($proc.ExitCode -ne 0) {
               Write-Error "winget install Tailscale failed with exit code $($proc.ExitCode)"
               exit 1

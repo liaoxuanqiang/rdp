@@ -340,9 +340,11 @@ jobs:
           Write-Host "=== Tailscale 配置完成 ==="
       - name: Install and Start llama.cpp
         run: |
+          # ════════════════════════════════════════════
+          # 1. winget 安装 llama.cpp
+          #    --source winget 跳过 msstore 协议确认
+          # ════════════════════════════════════════════
           Write-Host "Installing llama.cpp via winget..."
-
-          # ── winget 安装 llama.cpp（仅 winget 源，避免 msstore 协议确认） ──
           $proc = Start-Process -FilePath "winget" -ArgumentList "install", "llama.cpp", "--source", "winget", "--accept-package-agreements", "--silent", "--disable-interactivity" -NoNewWindow -Wait -PassThru
           if ($proc.ExitCode -ne 0) {
               Write-Error "winget install llama.cpp failed with exit code $($proc.ExitCode)"
@@ -350,10 +352,12 @@ jobs:
           }
           Write-Host "llama.cpp installed via winget."
 
-          # 刷新 PATH
+          # 刷新 PATH，使 llama.exe 在当前会话中可用
           $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
 
-          # ── 查找 llama.exe ──
+          # ════════════════════════════════════════════
+          # 2. 查找 llama.exe 并写入系统 PATH（持久化）
+          # ════════════════════════════════════════════
           $llamaPath = & where.exe llama.exe 2>$null
           if (-not $llamaPath) {
               $llamaPath = (Get-Command llama.exe -ErrorAction SilentlyContinue).Source
@@ -364,7 +368,6 @@ jobs:
           }
           Write-Host "llama.cpp installed. Path: $llamaPath"
 
-          # 将 llama 目录写入系统 PATH
           $llamaDir = Split-Path $llamaPath -Parent
           $currentPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
           if ($currentPath -notlike "*$llamaDir*") {
@@ -373,16 +376,18 @@ jobs:
           }
           $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";" + [Environment]::GetEnvironmentVariable('Path', 'User')
 
-          # ── 使用 llama download 下载模型到共享路径 ──
+          # ════════════════════════════════════════════
+          # 3. 使用 llama download 下载 MiniCPM5 模型
+          #    优先用内置工具，失败则回退 WebClient
+          # ════════════════════════════════════════════
           Write-Host "Downloading MiniCPM5-1B-F16.gguf via llama download..."
 
           $modelDir = "C:\ProgramData\llama-models"
           $null = New-Item -Path $modelDir -ItemType Directory -Force
+          # 赋予 Everyone 读取权限，确保 RDP 用户也可访问
           icacls $modelDir /grant "Everyone:(OI)(CI)R" /T /Q 2>$null
           $modelPath = "$modelDir\MiniCPM5-1B-F16.gguf"
 
-          # llama download 下载模型（带 fallback 到 WebClient）
-          Write-Host "Running: llama download --hf-repo openbmb/MiniCPM5-1B-GGUF --hf-file MiniCPM5-1B-F16.gguf --output-dir $modelDir"
           & $llamaPath download --hf-repo openbmb/MiniCPM5-1B-GGUF --hf-file MiniCPM5-1B-F16.gguf --output-dir "$modelDir"
           $downloadExit = $LASTEXITCODE
 
@@ -408,9 +413,12 @@ jobs:
           $localMB = [math]::Round((Get-Item $modelPath).Length / 1MB, 2)
           Write-Host "Model ready at: $modelPath ($localMB MB)"
 
-          # ── 注册 Windows 服务（带 --model） ──
+          # ════════════════════════════════════════════
+          # 4. 注册 llama Windows 服务并启动
+          #    作为 Windows 服务运行可跨越会话边界，
+          #    不被 GitHub Actions 工作流结束所中断
+          # ════════════════════════════════════════════
           Write-Host "Registering llama.cpp serve as Windows service..."
-          $llamaLog = "$env:ProgramData\llama-models\llama-server.log"
           $null = New-Item -Path "$env:ProgramData\llama-models" -ItemType Directory -Force
 
           $existing = Get-Service -Name "llama" -ErrorAction SilentlyContinue
@@ -426,10 +434,12 @@ jobs:
               -StartupType Automatic `
               -DisplayName "llama.cpp Server" `
               -Description "llama.cpp inference server with MiniCPM5-1B model"
+
+          # 服务崩溃后自动重启，间隔 5s → 10s → 30s
           sc.exe failure llama reset= 86400 actions= restart/5000/restart/10000/restart/30000
           sc.exe start llama
 
-          # 等待最多 30 秒让服务启动
+          # 轮询等待 8080 端口就绪（最多 30 秒）
           Write-Host "Waiting for llama service to start..."
           $timeout = 30
           $elapsed = 0
@@ -441,8 +451,9 @@ jobs:
               $svc = Get-Service -Name "llama" -ErrorAction SilentlyContinue
               if ($svc -and $svc.Status -eq 'Stopped') {
                   Write-Error "llama service stopped unexpectedly."
-                  $svcLog = "$env:ProgramData\llama-models\llama-server.log"
-                  if (Test-Path $svcLog) { Get-Content $svcLog -Tail 20 -ErrorAction SilentlyContinue }
+                  if (Test-Path "$env:ProgramData\llama-models\llama-server.log") {
+                      Get-Content "$env:ProgramData\llama-models\llama-server.log" -Tail 20 -ErrorAction SilentlyContinue
+                  }
                   exit 1
               }
               Write-Host "  Waiting for llama serve... ${elapsed}s"

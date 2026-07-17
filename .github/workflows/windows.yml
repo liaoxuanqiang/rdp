@@ -406,33 +406,42 @@ jobs:
           Write-Host "Model ready at: $modelPath ($localMB MB)"
 
           # ════════════════════════════════════════════
-          # 4. 注册 llama Windows 服务并启动
-          #    作为 Windows 服务运行可跨越会话边界，
-          #    不被 GitHub Actions 工作流结束所中断
+          # 4. 启动 llama.cpp serve 后台进程
+          #    llama.exe 不是 Windows 服务程序，不能用 New-Service。
+          #    改用隐藏后台进程 + 系统启动计划任务保证持久性。
           # ════════════════════════════════════════════
-          Write-Host "Registering llama.cpp serve as Windows service..."
           $null = New-Item -Path "$env:ProgramData\llama-models" -ItemType Directory -Force
 
+          # 清理旧注册（如果用 New-Service 注册过，sc delete 删掉）
           $existing = Get-Service -Name "llama" -ErrorAction SilentlyContinue
           if ($existing) {
+              Write-Host "  Cleaning stale service entry..."
               sc.exe stop llama 2>$null
               sc.exe delete llama 2>$null
               Start-Sleep -Seconds 2
           }
 
-          $binaryPath = "`"$llamaPath`" serve --port 8080 --host 0.0.0.0 --model `"$modelPath`""
-          New-Service -Name "llama" `
-              -BinaryPathName $binaryPath `
-              -StartupType Automatic `
-              -DisplayName "llama.cpp Server" `
-              -Description "llama.cpp inference server with MiniCPM5-1B model"
+          $logFile = "$env:ProgramData\llama-models\llama-server.log"
+          $serveArgs = "serve --port 8080 --host 0.0.0.0 --model `"$modelPath`""
 
-          # 服务崩溃后自动重启，间隔 5s → 10s → 30s
-          sc.exe failure llama reset= 86400 actions= restart/5000/restart/10000/restart/30000
-          sc.exe start llama
+          # 启动后台进程（隐藏窗口）
+          Write-Host "Starting llama.exe serve as background process..."
+          $proc = Start-Process -FilePath $llamaPath `
+              -ArgumentList $serveArgs `
+              -NoNewWindow -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "${logFile}.err"
+          Write-Host "  Started PID: $($proc.Id)"
+
+          # 创建系统启动计划任务（确保重启后自动运行）
+          $taskName = "llama-cpp-serve"
+          schtasks /CREATE /TN $taskName /SC ONSTART /DELAY 0001:00 /RL HIGHEST /RU SYSTEM /TR "`"$llamaPath`" $serveArgs" /F 2>$null
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Created scheduled task '$taskName' for auto-start on boot."
+          } else {
+              Write-Warning "Scheduled task creation skipped (exit code: $LASTEXITCODE)."
+          }
 
           # 轮询等待 8080 端口就绪（最多 30 秒）
-          Write-Host "Waiting for llama service to start..."
+          Write-Host "Waiting for llama serve to start..."
           $timeout = 30
           $elapsed = 0
           do {
@@ -440,21 +449,23 @@ jobs:
               $elapsed += 3
               $listening = netstat -an | Select-String ":8080.*LISTENING"
               if ($listening) { break }
-              $svc = Get-Service -Name "llama" -ErrorAction SilentlyContinue
-              if ($svc -and $svc.Status -eq 'Stopped') {
-                  Write-Error "llama service stopped unexpectedly."
-                  if (Test-Path "$env:ProgramData\llama-models\llama-server.log") {
-                      Get-Content "$env:ProgramData\llama-models\llama-server.log" -Tail 20 -ErrorAction SilentlyContinue
-                  }
+              # 检查进程是否还活着
+              $alive = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+              if (-not $alive) {
+                  Write-Host "--- stdout ---"
+                  if (Test-Path $logFile) { Get-Content $logFile -Tail 20 -ErrorAction SilentlyContinue }
+                  Write-Host "--- stderr ---"
+                  if (Test-Path "${logFile}.err") { Get-Content "${logFile}.err" -Tail 20 -ErrorAction SilentlyContinue }
+                  Write-Error "llama serve process exited prematurely."
                   exit 1
               }
               Write-Host "  Waiting for llama serve... ${elapsed}s"
           } while ($elapsed -lt $timeout)
 
           if ($listening) {
-              Write-Host "llama.cpp serve is listening on 0.0.0.0:8080 (Windows Service, with model)."
+              Write-Host "llama.cpp serve is listening on 0.0.0.0:8080 (PID: $($proc.Id))."
           } else {
-              Write-Warning "llama.cpp serve still not listening after ${timeout}s, but service is running."
+              Write-Warning "llama.cpp serve still not listening after ${timeout}s, but process is running."
           }
       - name: Maintain Connection
         env:

@@ -391,27 +391,32 @@ jobs:
           icacls $modelDir /grant "Everyone:(OI)(CI)R" /T /Q 2>$null
           $modelPath = "$modelDir\MiniCPM5-1B-F16.gguf"
 
-          # llama download 可能不支持 --output-dir，用默认位置再复制
-          $oldPwd = Get-Location
-          Set-Location $modelDir
+          # llama download 可能不支持 --output-dir，且会写到 HuggingFace 缓存
           & $llamaPath download --hf-repo openbmb/MiniCPM5-1B-GGUF --hf-file MiniCPM5-1B-F16.gguf
-          $exitCode = $LASTEXITCODE
-          Set-Location $oldPwd
 
-          # 如果下载成功，文件可能被放在了运行目录而非 $modelDir
+          # 不依赖 $LASTEXITCODE（新版可能返回非零即使成功），搜索缓存/模型目录
           if (-not (Test-Path $modelPath) -or (Get-Item $modelPath).Length -eq 0) {
-              # 尝试在模型目录中找刚刚下载的文件
-              $downloaded = Get-ChildItem -Path $modelDir -Filter "*.gguf" -Recurse | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-              if (-not $downloaded) {
-                  $downloaded = Get-ChildItem -Path $oldPwd -Filter "*.gguf" -Recurse | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              $cacheRoots = @(
+                  "$modelDir"
+                  "$env:USERPROFILE\.cache\huggingface\hub"
+                  "$env:LOCALAPPDATA\huggingface\hub"
+                  [Environment]::GetFolderPath('CommonApplicationData') + "\huggingface\hub"
+              )
+              $downloaded = $null
+              foreach ($root in $cacheRoots) {
+                  if (Test-Path $root) {
+                      $found = Get-ChildItem -Path $root -Filter "MiniCPM5-1B-F16.gguf" -Recurse -ErrorAction SilentlyContinue |
+                          Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                      if ($found) { $downloaded = $found; break }
+                  }
               }
-              if ($downloaded -and $downloaded.FullName -ne $modelPath) {
-                  Write-Host "  Moving $($downloaded.FullName) -> $modelPath"
+              if ($downloaded) {
+                  Write-Host "  Found in cache: $($downloaded.FullName)"
                   Copy-Item $downloaded.FullName $modelPath -Force
               }
           }
 
-          if ($exitCode -ne 0 -or -not (Test-Path $modelPath) -or (Get-Item $modelPath).Length -eq 0) {
+          if (-not (Test-Path $modelPath) -or (Get-Item $modelPath).Length -eq 0) {
               Write-Error "llama download failed — check network or Hugging Face availability"
               exit 1
           }

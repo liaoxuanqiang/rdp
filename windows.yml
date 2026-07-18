@@ -238,7 +238,23 @@ jobs:
           Write-Host "Tailscale installed."
 
           # ════════════════════════════════════════════
-          # 2. 认证 Tailscale
+          # 2. 安装 OpenSSH Server（Tailscale SSH 需要本地 sshd）
+          # ════════════════════════════════════════════
+          Write-Host "Installing OpenSSH Server for Tailscale SSH..."
+          $sshCap = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
+          if ($sshCap.State -ne 'Installed') {
+              Add-WindowsCapability -Online -Name $sshCap.Name
+              if ($LASTEXITCODE -ne 0) { Write-Warning "OpenSSH Server install returned $LASTEXITCODE" }
+          } else { Write-Host "  OpenSSH Server already installed." }
+          Set-Service -Name sshd -StartupType 'Automatic'
+          Start-Service -Name sshd -ErrorAction SilentlyContinue
+          # 放行 Windows 防火墙 22 端口
+          netsh advfirewall firewall delete rule name="OpenSSH-Server-In-TCP"
+          netsh advfirewall firewall add rule name="OpenSSH-Server-In-TCP" dir=in action=allow protocol=TCP localport=22
+          Write-Host "OpenSSH Server ready."
+
+          # ════════════════════════════════════════════
+          # 3. 认证 Tailscale（启用 SSH）
           # ════════════════════════════════════════════
           if ("$env:TAILSCALE_AUTH_KEY" -eq "") { Write-Error "TAILSCALE_AUTH_KEY missing"; exit 1 }
           Write-Host "Authenticating Tailscale..."
@@ -259,7 +275,7 @@ jobs:
           Write-Host "Tailscale IP: $tsIP"
 
           # ════════════════════════════════════════════
-          # 3. Tailscale API 操作（清理旧设备 + 设置名称 + MagicDNS + 子网路由）
+          # 4. Tailscale API 操作（清理旧设备 + 设置名称 + MagicDNS + 子网路由）
           # ════════════════════════════════════════════
           if ("$env:TAILSCALE_API_TOKEN" -ne "") {
               $apiBase = "https://api.tailscale.com/api/v2"
@@ -307,7 +323,7 @@ jobs:
           }
 
           # ════════════════════════════════════════════
-          # 4. 子网路由 + Exit Node
+          # 5. 子网路由 + Exit Node + SSH
           # ════════════════════════════════════════════
           $localIPs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' -and $_.InterfaceAlias -ne 'Tailscale' }
           $subnets = @()
@@ -321,8 +337,15 @@ jobs:
               [Array]::Reverse($netBytes)
               $subnets += "$([System.Net.IPAddress]::new($netBytes).IPAddressToString)/$($ip.PrefixLength)"
           }
-          & "$tsPath\tailscale.exe" set --advertise-routes="$($subnets -join ',')" --advertise-exit-node --accept-routes --accept-dns=false --ssh 2>$null
+          Write-Host "Configuring Tailscale with --ssh..."
+          & "$tsPath\tailscale.exe" set --advertise-routes="$($subnets -join ',')" --advertise-exit-node --accept-routes --accept-dns=false --ssh
           if ($LASTEXITCODE -ne 0) { Write-Warning "tailscale set 返回 $LASTEXITCODE（需控制台审批）" }
+          else { Write-Host "  tailscale set --ssh OK" }
+
+          # 验证 Tailscale SSH 状态
+          $sshStatus = & "$tsPath\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+          if ($sshStatus.Self.SSHEnabled -eq $true) { Write-Host "  Tailscale SSH: 已启用 ✓" }
+          else { Write-Warning "  Tailscale SSH 未启用（可能在控制台中仍需审批）" }
 
           Write-Host "Tailscale 配置完成！IP: $tsIP"
 

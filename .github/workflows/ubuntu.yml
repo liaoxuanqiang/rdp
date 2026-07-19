@@ -81,31 +81,31 @@ jobs:
 
           # 使用 Python 生成 VNC 密码文件（写入 VNC 用户家目录）
           python3 << PYEOF
-import os, struct
-pwd = os.environ['VNC_PASSWORD'].encode()[:8].ljust(8, b'\x00')
-key = bytes([23, 82, 107, 55, 103, 33, 189, 76])
-enc = bytes(a ^ b for a, b in zip(pwd, key))
-with open(os.path.join('$VNC_USER_HOME', '.vnc', 'passwd'), 'wb') as f:
-    f.write(enc)
-PYEOF
+          import os, struct
+          pwd = os.environ['VNC_PASSWORD'].encode()[:8].ljust(8, b'\x00')
+          key = bytes([23, 82, 107, 55, 103, 33, 189, 76])
+          enc = bytes(a ^ b for a, b in zip(pwd, key))
+          with open(os.path.join('$VNC_USER_HOME', '.vnc', 'passwd'), 'wb') as f:
+              f.write(enc)
+          PYEOF
           chmod 600 "$VNC_USER_HOME/.vnc/passwd"
 
           # 写入 xstartup 脚本
           cat > "$VNC_USER_HOME/.vnc/xstartup" << 'XSTARTUP'
-#!/bin/bash
-unset SESSION_MANAGER
-unset DBUS_SESSION_BUS_ADDRESS
-export XDG_SESSION_TYPE=x11
-exec startxfce4
-XSTARTUP
+          #!/bin/bash
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          export XDG_SESSION_TYPE=x11
+          exec startxfce4
+          XSTARTUP
           chmod 755 "$VNC_USER_HOME/.vnc/xstartup"
 
           # 写入 VNC 配置（分辨率、色深、仅监听 localhost）
           cat > "$VNC_USER_HOME/.vnc/config" << 'VNCCONFIG'
-geometry=1280x720
-depth=24
-localhost=yes
-VNCCONFIG
+          geometry=1280x720
+          depth=24
+          localhost=yes
+          VNCCONFIG
 
           # 确保 .vnc 目录所有权归 VNC 用户
           chown -R "$VNC_USERNAME:$VNC_USERNAME" "$VNC_USER_HOME/.vnc"

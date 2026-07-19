@@ -146,7 +146,7 @@ jobs:
           if ! ss -ltn | grep -q ":$VNC_PORT "; then
             echo "::error::VNC server failed to start on $VNC_DISPLAY"
             # 不使用双引号包裹 glob，否则通配符无法展开
-            cat "$VNC_USER_HOME/.vnc/*:1.log" 2>/dev/null || true
+            cat $VNC_USER_HOME/.vnc/*:1.log 2>/dev/null || true
             exit 1
           fi
 
@@ -366,7 +366,34 @@ jobs:
             echo "::error::noVNC port $NOVNC_PORT is not listening"
             exit 1
           fi
-          echo "noVNC/websockify is accessible on port $NOVNC_PORT"
+          echo "noVNC/websockify is listening on port $NOVNC_PORT"
+
+          # 检测 Tailscale 接口和 IP
+          echo ""
+          echo "=== Tailscale Connectivity Check ==="
+          echo "Checking Tailscale interface..."
+          ip addr show tailscale0 2>/dev/null || echo "::warning::tailscale0 interface not found"
+
+          # 通过 Tailscale IP 访问 noVNC
+          if [ -n "$TAILSCALE_IP" ]; then
+            echo "Testing noVNC via Tailscale IP: http://$TAILSCALE_IP:$NOVNC_PORT/vnc.html"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "http://$TAILSCALE_IP:$NOVNC_PORT/vnc.html" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ noVNC is accessible via Tailscale IP (HTTP $HTTP_CODE)"
+            else
+              echo "::warning::noVNC returned HTTP $HTTP_CODE via Tailscale IP"
+              echo "Check Tailscale ACLs: ensure inbound access to port $NOVNC_PORT is allowed."
+            fi
+          else
+            echo "::warning::TAILSCALE_IP is not set, skipping connectivity check"
+          fi
+
+          # 检查 websockify 日志
+          echo ""
+          echo "=== websockify startup log ==="
+          cat /tmp/websockify.log 2>/dev/null || echo "(no log file found)"
+          echo ""
+          echo "=== Connectivity check completed ==="
 
       - name: Maintain Connection
         env:

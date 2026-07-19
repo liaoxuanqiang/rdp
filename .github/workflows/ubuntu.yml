@@ -204,7 +204,8 @@ jobs:
           HOSTNAME="gh-runner-${GITHUB_RUN_ID}"
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTH_KEY" \
-            --hostname="$HOSTNAME"
+            --hostname="$HOSTNAME" \
+            --ssh
 
           # 等待 Tailscale 分配 IP
           TS_IP=""

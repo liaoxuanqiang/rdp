@@ -27,8 +27,8 @@ jobs:
               xfce4 xfce4-terminal xfce4-taskmanager
           fi
 
-          # 安装 TigerVNC Server（VNC 后端）
-          sudo apt-get install -y --no-install-recommends tigervnc-standalone-server tigervnc-common
+          # 安装 TigerVNC Server（VNC 后端）和工具（含 vncpasswd）
+          sudo apt-get install -y --no-install-recommends tigervnc-standalone-server tigervnc-common tigervnc-tools
 
           # 安装 noVNC 与 websockify（Web 客户端）
           sudo apt-get install -y --no-install-recommends novnc websockify
@@ -85,15 +85,8 @@ jobs:
           # 创建 .vnc 目录
           sudo mkdir -p "$VNC_USER_HOME/.vnc"
 
-          # 使用 Python 生成 VNC 密码文件（写入 VNC 用户家目录）
-          sudo VNC_PASSWORD="$VNC_PASSWORD" python3 << PYEOF
-          import os, struct
-          pwd = os.environ['VNC_PASSWORD'].encode()[:8].ljust(8, b'\x00')
-          key = bytes([23, 82, 107, 55, 103, 33, 189, 76])
-          enc = bytes(a ^ b for a, b in zip(pwd, key))
-          with open(os.path.join('$VNC_USER_HOME', '.vnc', 'passwd'), 'wb') as f:
-              f.write(enc)
-          PYEOF
+          # 使用 vncpasswd 生成 VNC 密码文件
+          printf '%s' "$VNC_PASSWORD" | sudo vncpasswd -f | sudo tee "$VNC_USER_HOME/.vnc/passwd" > /dev/null
           sudo chmod 600 "$VNC_USER_HOME/.vnc/passwd"
 
           # 写入 xstartup 脚本

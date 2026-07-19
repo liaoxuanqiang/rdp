@@ -261,14 +261,34 @@ jobs:
           echo "Resolved numeric Device ID: $DEVICE_ID"
           echo "TAILSCALE_DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
 
-          # 1. 设置机器名为 "ubuntu"
+          # 1. 检查是否已有名为 "ubuntu" 的设备，如有则先取消授权并移除
+          echo "Checking for existing device named 'ubuntu'..."
+          EXISTING_UBUNTU_IDS=$(echo "$DEVICES_JSON" | jq -r --arg ID "$DEVICE_ID" '.devices[] | select(.name == "ubuntu" and .id != $ID) | .id')
+          if [ -n "$EXISTING_UBUNTU_IDS" ]; then
+            echo "Found existing device(s) named 'ubuntu':"
+            while IFS= read -r OLD_ID; do
+              if [ -n "$OLD_ID" ]; then
+                echo "  Deauthorizing old device: $OLD_ID..."
+                curl -s -X POST "$API_BASE/device/$OLD_ID/deauthorize" \
+                  -H "$AUTH_HEADER" || echo "::warning::Failed to deauthorize device $OLD_ID"
+                echo "  Removing old device: $OLD_ID..."
+                curl -s -X DELETE "$API_BASE/device/$OLD_ID" \
+                  -H "$AUTH_HEADER" || echo "::warning::Failed to remove device $OLD_ID"
+                echo "  ✅ Device $OLD_ID removed."
+              fi
+            done <<< "$EXISTING_UBUNTU_IDS"
+          else
+            echo "No existing device named 'ubuntu' found."
+          fi
+
+          # 3. 设置当前机器名为 "ubuntu"
           echo "Setting machine name to 'ubuntu'..."
           curl -s -X POST "$API_BASE/device/$DEVICE_ID/name" \
             -H "$AUTH_HEADER" \
             -H "Content-Type: application/json" \
             -d '{"name":"ubuntu"}' || echo "::warning::Failed to set machine name"
 
-          # 2. 设置机器 IP：Tailscale CLI/API v2 不提供设置 IP 的接口
+          # 4. 设置机器 IP：Tailscale CLI/API v2 不提供设置 IP 的接口
           #    Tailscale 自动分配 IP，如需固定 IP 请在 Admin Console 中设置
           #    （每个设备注册到同一 tailnet 会获得相同的稳定 IP，不需要手动设置）
           echo "IP is automatically assigned by Tailscale (stable per device)."

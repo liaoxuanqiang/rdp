@@ -85,6 +85,10 @@ jobs:
           # 创建 .vnc 目录
           sudo mkdir -p "$VNC_USER_HOME/.vnc"
 
+          # 预创建用户运行时目录（避免 XFCE session 报错）
+          sudo mkdir -p /run/user/"$(id -u "$VNC_USERNAME")"
+          sudo chmod 700 /run/user/"$(id -u "$VNC_USERNAME")"
+
           # 使用 vncpasswd 生成 VNC 密码文件
           printf '%s' "$VNC_PASSWORD" | sudo vncpasswd -f | sudo tee "$VNC_USER_HOME/.vnc/passwd" > /dev/null
           sudo chmod 600 "$VNC_USER_HOME/.vnc/passwd"
@@ -95,6 +99,19 @@ jobs:
           unset SESSION_MANAGER
           unset DBUS_SESSION_BUS_ADDRESS
           export XDG_SESSION_TYPE=x11
+
+          # 设置用户运行时目录（解决 dbus/XFCE session 错误）
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          if [ ! -d "$XDG_RUNTIME_DIR" ]; then
+            mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+            chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+          fi
+
+          # 确保 dbus 已启动
+          if [ -z "$DBUS_SESSION_BUS_ADDRESS" ] && command -v dbus-launch >/dev/null 2>&1; then
+            eval "$(dbus-launch --sh-syntax)"
+          fi
+
           exec startxfce4
           XSTARTUP
           sudo chmod 755 "$VNC_USER_HOME/.vnc/xstartup"
@@ -194,10 +211,9 @@ jobs:
 
           echo "TAILSCALE_AUTH_KEY is configured. Authenticating Tailscale..."
 
-          HOSTNAME="gh-runner-${GITHUB_RUN_ID}"
           sudo tailscale up \
             --authkey="$TAILSCALE_AUTH_KEY" \
-            --hostname="$HOSTNAME" \
+            --hostname="ubuntu" \
             --ssh
 
           # 等待 Tailscale 分配 IP
